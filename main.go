@@ -372,7 +372,6 @@ func sendMessage(conn net.Conn, messageType uint32, message proto.Message) {
 }
 
 func handlePingRequest(conn net.Conn) {
-	log.Printf("PingRequest received, sending PingResponse")
 	sendMessage(conn, messageTypePingResponse, &api.PingResponse{})
 }
 
