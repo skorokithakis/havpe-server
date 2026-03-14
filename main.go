@@ -81,6 +81,18 @@ const speechStartFramesRequired = 3
 // follow detected speech before end-of-speech is declared. 1280ms / 32ms = 40 frames.
 const silenceFramesRequired = 40
 
+// readDeadline is the duration after which a read on the TCP connection times out.
+// Refreshed after every successful ReadFrame call. When the device silently disappears
+// (power loss, no TCP RST), this prevents the server from blocking indefinitely until
+// OS-level TCP keepalive fires (~2 hours on Linux).
+const readDeadline = 60 * time.Second
+
+// backoffInitial is the starting delay for the reconnect backoff.
+const backoffInitial = 1 * time.Second
+
+// backoffMax is the maximum delay between reconnect attempts.
+const backoffMax = 60 * time.Second
+
 // detector is the Silero VAD instance used for end-of-speech detection. Initialized once
 // at startup by loading the ONNX model from the working directory.
 var detector *speech.Detector
@@ -224,17 +236,8 @@ func discoverVoicePE() (string, error) {
 }
 
 func main() {
-	host := os.Getenv("DEVICE_HOST")
-	if host == "" {
-		var err error
-		host, err = discoverVoicePE()
-		if err != nil {
-			log.Fatalf("device discovery: %v", err)
-		}
-	} else {
-		log.Printf("using DEVICE_HOST=%s", host)
-	}
-
+	// Validate required env vars before starting anything. These are permanent failures
+	// that cannot be recovered by retrying, so log.Fatalf is appropriate here.
 	elevenLabsAPIKey = os.Getenv("ELEVENLABS_API_KEY")
 	if elevenLabsAPIKey == "" {
 		log.Fatalf("ELEVENLABS_API_KEY environment variable is required")
@@ -286,28 +289,86 @@ func main() {
 		}
 	}()
 
-	address := host + ":6053"
-
-	log.Printf("connecting to %s", address)
-	conn, err := net.Dial("tcp", address)
-	if err != nil {
-		log.Fatalf("dial %s: %v", address, err)
+	// staticHost is non-empty when DEVICE_HOST is set. In that case we skip mDNS
+	// discovery on every iteration and use the fixed address instead.
+	staticHost := os.Getenv("DEVICE_HOST")
+	if staticHost != "" {
+		log.Printf("using DEVICE_HOST=%s", staticHost)
 	}
-	log.Printf("connected to %s", address)
 
-	localIP := conn.LocalAddr().(*net.TCPAddr).IP.String()
-	ttsURL := fmt.Sprintf("http://%s:%d/tone.wav", localIP, httpPort)
-	errorURL := fmt.Sprintf("http://%s:%d/error.wav", localIP, httpPort)
-	ttsResponseURL := fmt.Sprintf("http://%s:%d/tts.mp3", localIP, httpPort)
-	log.Printf("TTS tone URL: %s", ttsURL)
-	log.Printf("TTS error URL: %s", errorURL)
-	log.Printf("TTS response URL: %s", ttsResponseURL)
+	backoff := backoffInitial
+	attempt := 0
 
-	handleConnection(conn, ttsURL, errorURL, ttsResponseURL)
+	for {
+		attempt++
+
+		host := staticHost
+		if host == "" {
+			var err error
+			host, err = discoverVoicePE()
+			if err != nil {
+				log.Printf("device discovery (attempt %d): %v", attempt, err)
+				log.Printf("retrying in %v", backoff)
+				time.Sleep(backoff)
+				backoff = min(backoff*2, backoffMax)
+				continue
+			}
+		}
+
+		address := host + ":6053"
+		log.Printf("connecting to %s (attempt %d)", address, attempt)
+		conn, err := net.Dial("tcp", address)
+		if err != nil {
+			log.Printf("dial %s (attempt %d): %v", address, attempt, err)
+			log.Printf("retrying in %v", backoff)
+			time.Sleep(backoff)
+			backoff = min(backoff*2, backoffMax)
+			continue
+		}
+		log.Printf("connected to %s", address)
+
+		// ttsURL and friends depend on the local address, which may differ across
+		// reconnections (e.g. if the network interface changes).
+		localIP := conn.LocalAddr().(*net.TCPAddr).IP.String()
+		ttsURL := fmt.Sprintf("http://%s:%d/tone.wav", localIP, httpPort)
+		errorURL := fmt.Sprintf("http://%s:%d/error.wav", localIP, httpPort)
+		ttsResponseURL := fmt.Sprintf("http://%s:%d/tts.mp3", localIP, httpPort)
+		log.Printf("TTS tone URL: %s", ttsURL)
+		log.Printf("TTS error URL: %s", errorURL)
+		log.Printf("TTS response URL: %s", ttsResponseURL)
+
+		if err := handleConnection(conn, ttsURL, errorURL, ttsResponseURL, func() {
+			// Called by handleConnection when the handshake completes and the read loop
+			// starts. At this point the connection is healthy, so reset the backoff so
+			// that the next failure (if any) starts from the minimum delay again.
+			log.Printf("connection healthy, resetting backoff to %v", backoffInitial)
+			backoff = backoffInitial
+		}); err != nil {
+			log.Printf("connection ended with error (attempt %d): %v", attempt, err)
+			log.Printf("retrying in %v", backoff)
+			time.Sleep(backoff)
+			backoff = min(backoff*2, backoffMax)
+		} else {
+			// Clean disconnect (DisconnectRequest from device): reconnect immediately.
+			// Backoff was already reset when the read loop started.
+			log.Printf("connection closed cleanly, reconnecting immediately")
+		}
+	}
 }
 
-func handleConnection(conn net.Conn, ttsURL string, errorURL string, ttsResponseURL string) {
+// handleConnection performs the ESPHome handshake and then runs the main read loop until
+// the connection ends. It returns nil on a clean disconnect (DisconnectRequest) and a
+// non-nil error on any failure (dial error, handshake failure, read timeout, etc.).
+// onConnected is called once the handshake completes and the read loop starts; the caller
+// uses this to reset the reconnect backoff. The caller is responsible for retrying.
+func handleConnection(conn net.Conn, ttsURL string, errorURL string, ttsResponseURL string, onConnected func()) error {
 	defer conn.Close()
+
+	// Set the initial read deadline before the handshake. It is refreshed after every
+	// successful ReadFrame call so that a healthy but slow device does not time out.
+	if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+		return fmt.Errorf("set initial read deadline: %w", err)
+	}
 
 	// bufio.Reader is required so that ReadFrame can use it as an io.ByteReader
 	// for varint decoding without wrapping it again internally.
@@ -318,20 +379,22 @@ func handleConnection(conn net.Conn, ttsURL string, errorURL string, ttsResponse
 	// those transparently.
 
 	// Step 1: client sends HelloRequest to identify itself.
-	sendMessage(conn, messageTypeHelloRequest, &api.HelloRequest{
+	if err := sendMessage(conn, messageTypeHelloRequest, &api.HelloRequest{
 		ClientInfo:      "esphome-go-server",
 		ApiVersionMajor: 1,
 		ApiVersionMinor: 10,
-	})
+	}); err != nil {
+		return fmt.Errorf("send HelloRequest: %w", err)
+	}
 
 	// Step 2: device replies with HelloResponse.
 	helloData, err := readHandshakeResponse(conn, reader, messageTypeHelloResponse)
 	if err != nil {
-		log.Fatalf("hello handshake: %v", err)
+		return fmt.Errorf("hello handshake: %w", err)
 	}
 	var helloResponse api.HelloResponse
 	if err := proto.Unmarshal(helloData, &helloResponse); err != nil {
-		log.Fatalf("unmarshal HelloResponse: %v", err)
+		return fmt.Errorf("unmarshal HelloResponse: %w", err)
 	}
 	log.Printf("HelloResponse: server_info=%q name=%q api_version=%d.%d",
 		helloResponse.GetServerInfo(), helloResponse.GetName(),
@@ -341,61 +404,97 @@ func handleConnection(conn net.Conn, ttsURL string, errorURL string, ttsResponse
 	// Authentication (message IDs 3-4) was removed in ESPHome 2026.1.0; sending
 	// AuthenticationRequest causes the handshake to hang because the device never
 	// replies with AuthenticationResponse.
-	sendMessage(conn, messageTypeDeviceInfoRequest, &api.DeviceInfoRequest{})
+	if err := sendMessage(conn, messageTypeDeviceInfoRequest, &api.DeviceInfoRequest{}); err != nil {
+		return fmt.Errorf("send DeviceInfoRequest: %w", err)
+	}
 
 	// Step 4: device replies with DeviceInfoResponse.
 	deviceInfoData, err := readHandshakeResponse(conn, reader, messageTypeDeviceInfoResponse)
 	if err != nil {
-		log.Fatalf("device info handshake: %v", err)
+		return fmt.Errorf("device info handshake: %w", err)
 	}
 	var deviceInfoResponse api.DeviceInfoResponse
 	if err := proto.Unmarshal(deviceInfoData, &deviceInfoResponse); err != nil {
-		log.Fatalf("unmarshal DeviceInfoResponse: %v", err)
+		return fmt.Errorf("unmarshal DeviceInfoResponse: %w", err)
 	}
 	log.Printf("DeviceInfoResponse: name=%q model=%q", deviceInfoResponse.GetName(), deviceInfoResponse.GetModel())
 
 	// Step 5: client requests entity list; device sends multiple ListEntities* messages
 	// followed by ListEntitiesDoneResponse (ID 19).
-	sendMessage(conn, messageTypeListEntitiesRequest, &api.ListEntitiesRequest{})
+	if err := sendMessage(conn, messageTypeListEntitiesRequest, &api.ListEntitiesRequest{}); err != nil {
+		return fmt.Errorf("send ListEntitiesRequest: %w", err)
+	}
 	if err := drainEntityList(conn, reader); err != nil {
-		log.Fatalf("entity list: %v", err)
+		return fmt.Errorf("entity list: %w", err)
 	}
 
 	// Step 6: subscribe to state updates and voice assistant events.
-	sendMessage(conn, messageTypeSubscribeStatesRequest, &api.SubscribeStatesRequest{})
+	if err := sendMessage(conn, messageTypeSubscribeStatesRequest, &api.SubscribeStatesRequest{}); err != nil {
+		return fmt.Errorf("send SubscribeStatesRequest: %w", err)
+	}
 	// flags=1 requests API audio streaming (audio sent over the API connection, not UDP).
-	sendMessage(conn, messageTypeSubscribeVoiceAssistantRequest, &api.SubscribeVoiceAssistantRequest{
+	if err := sendMessage(conn, messageTypeSubscribeVoiceAssistantRequest, &api.SubscribeVoiceAssistantRequest{
 		Subscribe: true,
 		Flags:     1,
-	})
+	}); err != nil {
+		return fmt.Errorf("send SubscribeVoiceAssistantRequest: %w", err)
+	}
+
+	// Handshake complete: notify the caller that the connection is healthy so it can
+	// reset the reconnect backoff. This must happen before the read loop so that even
+	// a connection that drops immediately after the handshake resets the backoff.
+	log.Printf("handshake complete, entering read loop")
+	onConnected()
 
 	var pipeline pipelineState
 
 	for {
-		messageType, data, err := ReadFrame(reader)
+		messageType, data, err := readFrameWithDeadline(conn, reader)
 		if err != nil {
 			if err == io.EOF {
 				log.Println("connection closed by device")
 			} else {
 				log.Printf("read frame: %v", err)
 			}
-			return
+			return err
 		}
 
 		switch messageType {
 		case messageTypePingRequest:
-			handlePingRequest(conn)
+			if err := handlePingRequest(conn); err != nil {
+				return err
+			}
 		case messageTypeDisconnectRequest:
+			// Best-effort: send DisconnectResponse, but ignore write errors since we're
+			// closing the connection regardless.
 			handleDisconnectRequest(conn)
-			return
+			return nil
 		case messageTypeVoiceAssistantRequest:
-			handleVoiceAssistantRequest(conn, data, &pipeline)
+			if err := handleVoiceAssistantRequest(conn, data, &pipeline); err != nil {
+				return err
+			}
 		case messageTypeVoiceAssistantAudio:
-			handleVoiceAssistantAudio(conn, data, &pipeline, ttsURL, errorURL, ttsResponseURL)
+			if err := handleVoiceAssistantAudio(conn, data, &pipeline, ttsURL, errorURL, ttsResponseURL); err != nil {
+				return err
+			}
 		default:
 			log.Printf("ignoring message type %d", messageType)
 		}
 	}
+}
+
+// readFrameWithDeadline reads one frame and refreshes the read deadline on success.
+// Keeping the deadline refresh next to the ReadFrame call makes it obvious that every
+// successful read extends the window, and that a silent device will eventually time out.
+func readFrameWithDeadline(conn net.Conn, reader *bufio.Reader) (uint32, []byte, error) {
+	messageType, data, err := ReadFrame(reader)
+	if err != nil {
+		return 0, nil, err
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
+		return 0, nil, fmt.Errorf("refresh read deadline: %w", err)
+	}
+	return messageType, data, nil
 }
 
 // readHandshakeResponse reads frames from reader until a frame with the expected message
@@ -406,12 +505,14 @@ func handleConnection(conn net.Conn, ttsURL string, errorURL string, ttsResponse
 // service requests at any point during the handshake.
 func readHandshakeResponse(conn net.Conn, reader *bufio.Reader, expectedType uint32) ([]byte, error) {
 	for {
-		messageType, data, err := ReadFrame(reader)
+		messageType, data, err := readFrameWithDeadline(conn, reader)
 		if err != nil {
 			return nil, fmt.Errorf("reading frame (expected type %d): %w", expectedType, err)
 		}
 		if messageType == messageTypePingRequest {
-			handlePingRequest(conn)
+			if err := handlePingRequest(conn); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		if messageType != expectedType {
@@ -426,12 +527,14 @@ func readHandshakeResponse(conn net.Conn, reader *bufio.Reader, expectedType uin
 // responding to PingRequest frames along the way. Entity list frames are logged and ignored.
 func drainEntityList(conn net.Conn, reader *bufio.Reader) error {
 	for {
-		messageType, _, err := ReadFrame(reader)
+		messageType, _, err := readFrameWithDeadline(conn, reader)
 		if err != nil {
 			return fmt.Errorf("reading entity list frame: %w", err)
 		}
 		if messageType == messageTypePingRequest {
-			handlePingRequest(conn)
+			if err := handlePingRequest(conn); err != nil {
+				return err
+			}
 			continue
 		}
 		if messageType == messageTypeListEntitiesDoneResponse {
@@ -442,36 +545,38 @@ func drainEntityList(conn net.Conn, reader *bufio.Reader) error {
 	}
 }
 
-func sendMessage(conn net.Conn, messageType uint32, message proto.Message) {
+func sendMessage(conn net.Conn, messageType uint32, message proto.Message) error {
 	data, err := proto.Marshal(message)
 	if err != nil {
-		log.Printf("marshal message type %d: %v", messageType, err)
-		return
+		return fmt.Errorf("marshal message type %d: %w", messageType, err)
 	}
 	if err := WriteFrame(conn, messageType, data); err != nil {
-		log.Printf("write frame type %d: %v", messageType, err)
+		return fmt.Errorf("write frame type %d: %w", messageType, err)
 	}
+	return nil
 }
 
-func handlePingRequest(conn net.Conn) {
-	sendMessage(conn, messageTypePingResponse, &api.PingResponse{})
+func handlePingRequest(conn net.Conn) error {
+	return sendMessage(conn, messageTypePingResponse, &api.PingResponse{})
 }
 
 func handleDisconnectRequest(conn net.Conn) {
 	log.Printf("DisconnectRequest received, sending DisconnectResponse and closing")
-	sendMessage(conn, messageTypeDisconnectResponse, &api.DisconnectResponse{})
+	// Ignore the error: we are closing the connection regardless of whether the
+	// response was delivered.
+	_ = sendMessage(conn, messageTypeDisconnectResponse, &api.DisconnectResponse{})
 }
 
 // handleVoiceAssistantRequest handles message type 90. When start=true it begins a new
 // pipeline run: resets the pipeline state, records the start time, sends
 // VoiceAssistantResponse with port=0 (API audio mode), and sends the RUN_START and
 // STT_START events. When start=false the device has cancelled the run; we just reset state.
-func handleVoiceAssistantRequest(conn net.Conn, data []byte, pipeline *pipelineState) {
+func handleVoiceAssistantRequest(conn net.Conn, data []byte, pipeline *pipelineState) error {
 	var request api.VoiceAssistantRequest
 	if err := proto.Unmarshal(data, &request); err != nil {
 		log.Printf("unmarshal VoiceAssistantRequest: %v", err)
 		*pipeline = pipelineState{}
-		return
+		return nil
 	}
 
 	if !request.GetStart() {
@@ -480,8 +585,7 @@ func handleVoiceAssistantRequest(conn net.Conn, data []byte, pipeline *pipelineS
 		// The device may be stuck in AWAITING_RESPONSE or another non-idle state after
 		// sending start=false. Sending RUN_END ensures its state machine reaches IDLE and
 		// the on_end trigger fires to reset LEDs.
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
-		return
+		return sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 	}
 
 	log.Printf("VoiceAssistantRequest start=true: beginning pipeline run (wake_word=%q flags=%d)",
@@ -499,10 +603,14 @@ func handleVoiceAssistantRequest(conn net.Conn, data []byte, pipeline *pipelineS
 	}
 
 	// port=0 tells the device to stream audio over the API connection rather than UDP.
-	sendMessage(conn, messageTypeVoiceAssistantResponse, &api.VoiceAssistantResponse{Port: 0})
+	if err := sendMessage(conn, messageTypeVoiceAssistantResponse, &api.VoiceAssistantResponse{Port: 0}); err != nil {
+		return err
+	}
 
-	sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_START, nil)
-	sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_START, nil)
+	if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_START, nil); err != nil {
+		return err
+	}
+	return sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_START, nil)
 }
 
 // handleVoiceAssistantAudio handles message type 106. It accumulates PCM chunks into
@@ -511,21 +619,23 @@ func handleVoiceAssistantRequest(conn net.Conn, data []byte, pipeline *pipelineS
 // pipeline is finalized when 800ms of consecutive silence follows detected speech, or
 // when the hard audioCaptureWindow maximum is reached. Audio frames arriving when the
 // pipeline is inactive are silently ignored.
-func handleVoiceAssistantAudio(conn net.Conn, data []byte, pipeline *pipelineState, ttsURL string, errorURL string, ttsResponseURL string) {
+func handleVoiceAssistantAudio(conn net.Conn, data []byte, pipeline *pipelineState, ttsURL string, errorURL string, ttsResponseURL string) error {
 	if !pipeline.active {
 		log.Printf("audio chunk received but no active pipeline, ignoring")
-		return
+		return nil
 	}
 
 	var chunk api.VoiceAssistantAudio
 	if err := proto.Unmarshal(data, &chunk); err != nil {
 		log.Printf("unmarshal VoiceAssistantAudio: %v", err)
-		return
+		return nil
 	}
 
 	if !pipeline.vadStartSent {
 		log.Printf("first audio chunk received, sending STT_VAD_START")
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_VAD_START, nil)
+		if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_VAD_START, nil); err != nil {
+			return err
+		}
 		pipeline.vadStartSent = true
 	}
 
@@ -575,8 +685,7 @@ func handleVoiceAssistantAudio(conn net.Conn, data []byte, pipeline *pipelineSta
 				log.Printf("VAD end-of-speech detected after %d silence frames, finalising pipeline",
 					pipeline.consecutiveSilenceFrames)
 				pipeline.active = false
-				runPipelineResponse(conn, pipeline.audioBuffer, ttsURL, errorURL, ttsResponseURL)
-				return
+				return runPipelineResponse(conn, pipeline.audioBuffer, ttsURL, errorURL, ttsResponseURL)
 			}
 		}
 	}
@@ -586,20 +695,23 @@ func handleVoiceAssistantAudio(conn net.Conn, data []byte, pipeline *pipelineSta
 	if !pipeline.speechDetected && elapsed >= preSpeechTimeout {
 		log.Printf("no speech detected after %v, aborting pipeline", preSpeechTimeout)
 		pipeline.active = false
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
+		if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
 			{Name: "code", Value: "stt-no-text-recognized"},
 			{Name: "message", Value: "No speech detected"},
-		})
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
-		return
+		}); err != nil {
+			return err
+		}
+		return sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 	}
 
 	if elapsed >= audioCaptureWindow {
 		// Hard safety cap: finalize even if VAD never triggered end-of-speech.
 		log.Printf("audio capture window elapsed, finalising pipeline")
 		pipeline.active = false
-		runPipelineResponse(conn, pipeline.audioBuffer, ttsURL, errorURL, ttsResponseURL)
+		return runPipelineResponse(conn, pipeline.audioBuffer, ttsURL, errorURL, ttsResponseURL)
 	}
+
+	return nil
 }
 
 // transcribeAudio builds a WAV file in memory from the raw PCM audio buffer and sends it
@@ -760,43 +872,58 @@ func postWebhook(transcript string) (string, error) {
 // sends the remaining pipeline events to the device. When the webhook returns a non-empty
 // response text, it is synthesized to speech and the device plays ttsResponseURL; otherwise
 // the device plays ttsURL (tone.wav). On any failure it plays errorURL with a VOICE_ASSISTANT_ERROR event.
-func runPipelineResponse(conn net.Conn, audioBuffer []byte, ttsURL string, errorURL string, ttsResponseURL string) {
-	sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_VAD_END, nil)
+// On the first write error, it stops sending further events and returns immediately.
+func runPipelineResponse(conn net.Conn, audioBuffer []byte, ttsURL string, errorURL string, ttsResponseURL string) error {
+	if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_VAD_END, nil); err != nil {
+		return err
+	}
 
 	transcript, err := transcribeAudio(audioBuffer)
 	if err != nil {
 		log.Printf("transcribeAudio error: %v", err)
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
+		if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
 			{Name: "code", Value: "pipeline-error"},
 			{Name: "message", Value: err.Error()},
-		})
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, nil)
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, []*api.VoiceAssistantEventData{
+		}); err != nil {
+			return err
+		}
+		if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, nil); err != nil {
+			return err
+		}
+		if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, []*api.VoiceAssistantEventData{
 			{Name: "url", Value: errorURL},
-		})
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
-		return
+		}); err != nil {
+			return err
+		}
+		return sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 	}
 
 	log.Printf("transcript: %q", transcript)
 
-	sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_END, []*api.VoiceAssistantEventData{
+	if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_END, []*api.VoiceAssistantEventData{
 		{Name: "text", Value: transcript},
-	})
+	}); err != nil {
+		return err
+	}
 
 	responseText, err := postWebhook(transcript)
 	if err != nil {
 		log.Printf("postWebhook error: %v", err)
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
+		if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
 			{Name: "code", Value: "pipeline-error"},
 			{Name: "message", Value: err.Error()},
-		})
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, nil)
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, []*api.VoiceAssistantEventData{
+		}); err != nil {
+			return err
+		}
+		if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, nil); err != nil {
+			return err
+		}
+		if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, []*api.VoiceAssistantEventData{
 			{Name: "url", Value: errorURL},
-		})
-		sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
-		return
+		}); err != nil {
+			return err
+		}
+		return sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 	}
 
 	playbackURL := ttsURL
@@ -812,15 +939,23 @@ func runPipelineResponse(conn net.Conn, audioBuffer []byte, ttsURL string, error
 		}
 	}
 
-	sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_INTENT_START, nil)
-	sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_INTENT_END, nil)
-	sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, []*api.VoiceAssistantEventData{
+	if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_INTENT_START, nil); err != nil {
+		return err
+	}
+	if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_INTENT_END, nil); err != nil {
+		return err
+	}
+	if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, []*api.VoiceAssistantEventData{
 		{Name: "text", Value: responseText},
-	})
-	sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, []*api.VoiceAssistantEventData{
+	}); err != nil {
+		return err
+	}
+	if err := sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, []*api.VoiceAssistantEventData{
 		{Name: "url", Value: playbackURL},
-	})
-	sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
+	}); err != nil {
+		return err
+	}
+	return sendEvent(conn, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 }
 
 // synthesizeSpeech calls the ElevenLabs TTS API and returns the mp3 audio bytes.
@@ -861,9 +996,9 @@ func synthesizeSpeech(text string) ([]byte, error) {
 }
 
 // sendEvent sends a VoiceAssistantEventResponse with the given event type and optional data.
-func sendEvent(conn net.Conn, eventType api.VoiceAssistantEvent, data []*api.VoiceAssistantEventData) {
+func sendEvent(conn net.Conn, eventType api.VoiceAssistantEvent, data []*api.VoiceAssistantEventData) error {
 	log.Printf("sending event %s", eventType)
-	sendMessage(conn, messageTypeVoiceAssistantEventResponse, &api.VoiceAssistantEventResponse{
+	return sendMessage(conn, messageTypeVoiceAssistantEventResponse, &api.VoiceAssistantEventResponse{
 		EventType: eventType,
 		Data:      data,
 	})
