@@ -30,3 +30,4 @@ go.work
 havpe-server
 *.onnx
 .envrc
+misc/coding-team

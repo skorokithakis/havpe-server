@@ -19,6 +19,7 @@ import (
 
 	"havpe-server/api"
 
+	"github.com/hashicorp/mdns"
 	"github.com/streamer45/silero-vad-go/speech"
 	"google.golang.org/protobuf/proto"
 )
@@ -147,9 +148,91 @@ type pipelineState struct {
 // Defined as a const so it is easy to change without hunting through the code.
 const httpPort = 8085
 
+// discoverVoicePE browses for _esphomelib._tcp mDNS services for 5 seconds and returns
+// the IP address of the first entry whose hostname starts with "home-assistant-voice"
+// (case-insensitive). Returns an IP rather than a hostname because .local mDNS names
+// don't resolve inside Docker containers. If zero matching devices are found it returns
+// an error. If multiple are found it logs all of them and returns an error asking the
+// user to set DEVICE_HOST explicitly.
+func discoverVoicePE() (string, error) {
+	const (
+		service        = "_esphomelib._tcp"
+		browseTimeout  = 5 * time.Second
+		hostnamePrefix = "home-assistant-voice"
+	)
+
+	// The entries channel must be buffered and read concurrently: the library sends
+	// to it inside Query() without closing it, so we collect in a goroutine and
+	// wait for Query to return (which it does after params.Timeout elapses).
+	entries := make(chan *mdns.ServiceEntry, 16)
+	params := mdns.DefaultParams(service)
+	params.Entries = entries
+	params.Timeout = browseTimeout
+
+	log.Printf("browsing for %s mDNS services for %v", service, browseTimeout)
+
+	// Keyed by trimmed hostname to de-duplicate responses from the same device
+	// arriving on multiple interfaces or as retransmissions.
+	matches := make(map[string]net.IP)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for entry := range entries {
+			// entry.Host is a FQDN with a trailing dot; trim it for readability and matching.
+			host := strings.TrimSuffix(entry.Host, ".")
+			if strings.HasPrefix(strings.ToLower(host), hostnamePrefix) {
+				addr := entry.AddrV4
+				if addr == nil {
+					addr = entry.AddrV6
+				}
+				if addr == nil {
+					log.Printf("mDNS found: name=%q host=%q but no IP address, skipping", entry.Name, host)
+					continue
+				}
+				log.Printf("mDNS found: name=%q host=%q addr=%v port=%d", entry.Name, host, addr, entry.Port)
+				matches[host] = addr
+			}
+		}
+	}()
+
+	if err := mdns.Query(params); err != nil {
+		return "", fmt.Errorf("mDNS query: %w", err)
+	}
+	// Query has returned (timeout elapsed). Close entries so the collector goroutine exits.
+	close(entries)
+	<-done
+
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("no %s device found via mDNS; set DEVICE_HOST to specify the host explicitly", hostnamePrefix)
+	case 1:
+		for host, addr := range matches {
+			log.Printf("discovered device: %s (%s)", host, addr)
+			// .local mDNS names don't resolve inside Docker, so return the IP address directly.
+			return addr.String(), nil
+		}
+	default:
+		log.Printf("multiple matching devices found: %v", matches)
+		var hostnames []string
+		for host := range matches {
+			hostnames = append(hostnames, host)
+		}
+		return "", fmt.Errorf("multiple %s devices found (%v); set DEVICE_HOST to specify which one to use", hostnamePrefix, hostnames)
+	}
+	// Unreachable, but required to satisfy the compiler.
+	return "", fmt.Errorf("no %s device found via mDNS; set DEVICE_HOST to specify the host explicitly", hostnamePrefix)
+}
+
 func main() {
-	if len(os.Args) < 2 {
-		log.Fatalf("usage: %s <device-host>", os.Args[0])
+	host := os.Getenv("DEVICE_HOST")
+	if host == "" {
+		var err error
+		host, err = discoverVoicePE()
+		if err != nil {
+			log.Fatalf("device discovery: %v", err)
+		}
+	} else {
+		log.Printf("using DEVICE_HOST=%s", host)
 	}
 
 	elevenLabsAPIKey = os.Getenv("ELEVENLABS_API_KEY")
@@ -203,7 +286,6 @@ func main() {
 		}
 	}()
 
-	host := os.Args[1]
 	address := host + ":6053"
 
 	log.Printf("connecting to %s", address)

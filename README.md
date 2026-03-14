@@ -9,15 +9,10 @@ transcript to a webhook (e.g. a chatbot), and plays back the TTS response.
 
 ## Prerequisites
 
-- Go 1.25+
+- Docker
 - An ElevenLabs API key (for STT and TTS)
 - A webhook URL that accepts a JSON POST and returns a response
 - The Voice PE device on the same network, reachable on port 6053
-- The following files in the working directory (not checked in):
-  - `silero_vad.onnx` — [Silero VAD](https://github.com/snakers4/silero-vad)
-    v5 ONNX model
-  - `tone.wav` — audio played on successful pipeline completion
-  - `error.wav` — audio played on pipeline errors
 
 
 ## Preparing the Voice PE firmware
@@ -41,22 +36,14 @@ If there is an `encryption:` block with a `key:` underneath it, delete both
 lines. Then re-flash the firmware to the device.
 
 
-## Building
-
-```bash
-go build -o havpe-server .
-```
-
-
 ## Configuration
 
-Three environment variables are required:
-
-| Variable             | Description                                                                                    |
-|----------------------|------------------------------------------------------------------------------------------------|
-| `ELEVENLABS_API_KEY` | Your ElevenLabs API key for STT and TTS                                                        |
-| `WEBHOOK_URL`        | URL to POST transcripts to (receives JSON, returns JSON)                                       |
-| `WEBHOOK_PAYLOAD`    | JSON template for the POST body; `$transcript` is replaced with the JSON-escaped transcript    |
+| Variable             | Required | Description                                                                                    |
+|----------------------|----------|------------------------------------------------------------------------------------------------|
+| `ELEVENLABS_API_KEY` | Yes      | Your ElevenLabs API key for STT and TTS                                                        |
+| `WEBHOOK_URL`        | Yes      | URL to POST transcripts to (receives JSON, returns JSON)                                       |
+| `WEBHOOK_PAYLOAD`    | Yes      | JSON template for the POST body; `$transcript` is replaced with the JSON-escaped transcript    |
+| `DEVICE_HOST`        | No       | Hostname or IP of the Voice PE device. If not set, the server discovers it via mDNS by looking for ESPHome devices named `home-assistant-voice-*`. |
 
 You can use a `.envrc` file with [direnv](https://direnv.net/) to set these
 automatically.
@@ -64,11 +51,30 @@ automatically.
 
 ## Running
 
+### Docker
+
 ```bash
-./havpe-server <device-host>
+docker run --network host \
+  -e ELEVENLABS_API_KEY \
+  -e WEBHOOK_URL \
+  -e WEBHOOK_PAYLOAD \
+  ghcr.io/skorokithakis/havpe-server
 ```
 
-Where `<device-host>` is the hostname or IP address of the Voice PE device.
+`--network host` is required so that mDNS discovery works and so the device
+can reach the HTTP server. If you want to skip discovery, set `DEVICE_HOST` to
+the hostname or IP of the device.
+
+### From source
+
+```bash
+go build -o havpe-server . && ./havpe-server
+```
+
+You need Go 1.25+ and must download `silero_vad.onnx` (the
+[Silero VAD](https://github.com/snakers4/silero-vad) v5 ONNX model) and place
+it in the working directory before running.
+
 The server will:
 
 1. Connect to the device on port 6053.
