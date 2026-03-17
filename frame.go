@@ -54,22 +54,25 @@ func ReadFrame(reader io.Reader) (messageType uint32, data []byte, err error) {
 
 // WriteFrame writes one plaintext ESPHome native API frame to writer.
 // The frame format is: preamble (0x00) | size varint | type varint | body bytes.
+//
+// The entire frame is assembled into a single slice before calling writer.Write
+// once. This is essential for correctness when writer is a lockedWriter: two
+// separate Write calls (header then body) would release and re-acquire the lock
+// between them, allowing a concurrent goroutine to interleave its bytes and
+// corrupt the stream.
 func WriteFrame(writer io.Writer, messageType uint32, data []byte) error {
 	// Pre-allocate a buffer large enough for the worst case: preamble (1) +
 	// two varints (up to 10 bytes each) + body.
-	header := make([]byte, 1+binary.MaxVarintLen64+binary.MaxVarintLen64)
-	header[0] = plaintextPreamble
+	frame := make([]byte, 1+binary.MaxVarintLen64+binary.MaxVarintLen64+len(data))
+	frame[0] = plaintextPreamble
 	offset := 1
-	offset += binary.PutUvarint(header[offset:], uint64(len(data)))
-	offset += binary.PutUvarint(header[offset:], uint64(messageType))
+	offset += binary.PutUvarint(frame[offset:], uint64(len(data)))
+	offset += binary.PutUvarint(frame[offset:], uint64(messageType))
+	copy(frame[offset:], data)
+	offset += len(data)
 
-	if _, err := writer.Write(header[:offset]); err != nil {
-		return fmt.Errorf("writing frame header: %w", err)
-	}
-	if len(data) > 0 {
-		if _, err := writer.Write(data); err != nil {
-			return fmt.Errorf("writing frame body: %w", err)
-		}
+	if _, err := writer.Write(frame[:offset]); err != nil {
+		return fmt.Errorf("writing frame: %w", err)
 	}
 	return nil
 }
