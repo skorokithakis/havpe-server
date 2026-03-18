@@ -44,9 +44,46 @@ lines. Then re-flash the firmware to the device.
 | `WEBHOOK_URL`        | Yes      | URL to POST transcripts to (receives JSON, returns JSON)                                       |
 | `WEBHOOK_PAYLOAD`    | Yes      | JSON template for the POST body; `$transcript` is replaced with the JSON-escaped transcript    |
 | `DEVICE_HOST`        | No       | Hostname or IP of the Voice PE device. If not set, the server discovers it via mDNS by looking for ESPHome devices named `home-assistant-voice-*`. |
+| `API_PASSWORD`       | No*      | Password for the shortcuts CRUD API (HTTP Basic Auth). Required when `-shortcuts` is set.      |
 
 You can use a `.envrc` file with [direnv](https://direnv.net/) to set these
 automatically.
+
+
+## Shortcuts
+
+Shortcuts are an ordered list of regex/URL pairs that are checked against each
+transcript before it is sent to the webhook. The first matching regex wins: the
+server POSTs an empty body to the associated URL, plays the confirmation tone on
+a 200 response, or plays the error sound on any other outcome. If no shortcut
+matches, the transcript falls through to the normal webhook flow.
+
+The shortcuts file is a JSON array of `["regex", "url"]` pairs:
+
+```json
+[
+  ["turn on the lights", "http://homeassistant.local:8123/api/webhook/lights-on"],
+  ["^(good night|goodnight)$", "http://homeassistant.local:8123/api/webhook/goodnight"]
+]
+```
+
+Pass the path to this file with the `-shortcuts` flag. If the file does not
+exist it is created automatically as an empty list (`[]`).
+
+### Shortcuts CRUD API
+
+When `-shortcuts` is set, the server exposes a small REST API on the same port
+(8085) for managing shortcuts at runtime. All endpoints require HTTP Basic Auth
+with any username and `API_PASSWORD` as the password.
+
+| Method   | Path                  | Description                                      |
+|----------|-----------------------|--------------------------------------------------|
+| `GET`    | `/shortcuts`          | Return the full list as a JSON array             |
+| `POST`   | `/shortcuts`          | Append a new `["regex", "url"]` pair             |
+| `PUT`    | `/shortcuts/{index}`  | Replace the shortcut at the given index          |
+| `DELETE` | `/shortcuts/{index}`  | Remove the shortcut at the given index           |
+
+Changes are persisted to the shortcuts file immediately after each write.
 
 
 ## Running
@@ -61,6 +98,19 @@ docker run --network host \
   ghcr.io/skorokithakis/havpe-server
 ```
 
+To use shortcuts, add `API_PASSWORD` and mount a file for persistence:
+
+```bash
+docker run --network host \
+  -e ELEVENLABS_API_KEY \
+  -e WEBHOOK_URL \
+  -e WEBHOOK_PAYLOAD \
+  -e API_PASSWORD \
+  -v ./shortcuts.json:/app/shortcuts.json \
+  ghcr.io/skorokithakis/havpe-server \
+  -shortcuts /app/shortcuts.json
+```
+
 `--network host` is required so that mDNS discovery works and so the device
 can reach the HTTP server. If you want to skip discovery, set `DEVICE_HOST` to
 the hostname or IP of the device.
@@ -68,7 +118,7 @@ the hostname or IP of the device.
 ### From source
 
 ```bash
-go build -o havpe-server . && ./havpe-server
+go build -o havpe-server . && ./havpe-server [-shortcuts shortcuts.json]
 ```
 
 You need Go 1.25+ and must download `silero_vad.onnx` (the

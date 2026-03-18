@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,8 @@ import (
 	"net/http"
 	"net/textproto"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -118,6 +121,293 @@ var webhookPayload string
 // ttsAudioMutex so that concurrent HTTP requests and pipeline writes don't race.
 var ttsAudioBuffer []byte
 var ttsAudioMutex sync.Mutex
+
+// shortcut pairs a compiled regular expression with the URL to POST to when the
+// expression matches a transcript.
+type shortcut struct {
+	Pattern *regexp.Regexp
+	URL     string
+}
+
+// shortcuts is the list of active shortcuts, protected by shortcutsMutex.
+// A future CRUD API will write to this slice, hence the RWMutex.
+var shortcuts []shortcut
+var shortcutsMutex sync.RWMutex
+
+// shortcutsFilePath is the path to the shortcuts JSON file, set from the -shortcuts
+// flag. It is stored here so saveShortcuts can use it without an argument.
+var shortcutsFilePath string
+
+// apiPassword is the password required for HTTP Basic Auth on the shortcuts CRUD
+// endpoints. Read from API_PASSWORD at startup; required when -shortcuts is set.
+var apiPassword string
+
+// loadShortcuts reads the JSON file at path and returns a slice of compiled shortcuts.
+// The file format is an array of [regex, url] pairs: [["pattern", "https://..."], ...].
+// Returns an error if the file cannot be read, the JSON is malformed, or any regex fails
+// to compile.
+func loadShortcuts(path string) ([]shortcut, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read shortcuts file: %w", err)
+	}
+
+	var raw [][2]string
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse shortcuts JSON: %w", err)
+	}
+
+	result := make([]shortcut, 0, len(raw))
+	for index, pair := range raw {
+		pattern, err := regexp.Compile("(?i)" + pair[0])
+		if err != nil {
+			return nil, fmt.Errorf("shortcuts[%d]: compile regex %q: %w", index, pair[0], err)
+		}
+		result = append(result, shortcut{Pattern: pattern, URL: pair[1]})
+	}
+	return result, nil
+}
+
+// saveShortcuts writes the current shortcuts slice to the file at shortcutsFilePath.
+// The output format matches what loadShortcuts expects: [["pattern", "url"], ...].
+func saveShortcuts(path string) error {
+	shortcutsMutex.RLock()
+	raw := make([][2]string, len(shortcuts))
+	for index, shortcut := range shortcuts {
+		raw[index] = [2]string{shortcut.Pattern.String(), shortcut.URL}
+	}
+	shortcutsMutex.RUnlock()
+
+	data, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal shortcuts: %w", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		return fmt.Errorf("write shortcuts file: %w", err)
+	}
+	return nil
+}
+
+// requireAuth checks HTTP Basic Auth against apiPassword. The username is ignored;
+// only the password must match. Returns true if auth is valid. On failure it writes
+// a 401 response with a WWW-Authenticate header and returns false.
+func requireAuth(w http.ResponseWriter, r *http.Request) bool {
+	_, password, ok := r.BasicAuth()
+	if !ok || password != apiPassword {
+		w.Header().Set("WWW-Authenticate", `Basic realm="shortcuts"`)
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
+// shortcutsAsJSON serialises the current shortcuts slice as a [][2]string JSON array.
+// The caller must not hold shortcutsMutex when calling this function.
+func shortcutsAsJSON() ([]byte, error) {
+	shortcutsMutex.RLock()
+	raw := make([][2]string, len(shortcuts))
+	for index, shortcut := range shortcuts {
+		raw[index] = [2]string{shortcut.Pattern.String(), shortcut.URL}
+	}
+	shortcutsMutex.RUnlock()
+
+	data, err := json.Marshal(raw)
+	if err != nil {
+		return nil, fmt.Errorf("marshal shortcuts: %w", err)
+	}
+	return data, nil
+}
+
+// handleGetShortcuts handles GET /shortcuts. Returns the current list as JSON.
+func handleGetShortcuts(w http.ResponseWriter, r *http.Request) {
+	if !requireAuth(w, r) {
+		return
+	}
+	data, err := shortcutsAsJSON()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+// handlePostShortcuts handles POST /shortcuts. Appends a new shortcut from the request
+// body (a ["regex", "url"] pair), saves, and returns 201 with the full updated list.
+func handlePostShortcuts(w http.ResponseWriter, r *http.Request) {
+	if !requireAuth(w, r) {
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	var pair [2]string
+	if err := json.Unmarshal(body, &pair); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	pattern, err := regexp.Compile(pair[0])
+	if err != nil {
+		http.Error(w, "invalid regex: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	shortcutsMutex.Lock()
+	shortcuts = append(shortcuts, shortcut{Pattern: pattern, URL: pair[1]})
+	shortcutsMutex.Unlock()
+
+	if err := saveShortcuts(shortcutsFilePath); err != nil {
+		http.Error(w, "save shortcuts: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	data, err := shortcutsAsJSON()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	w.Write(data)
+}
+
+// handlePutShortcut handles PUT /shortcuts/{index}. Replaces the shortcut at the given
+// index with the pair from the request body. Returns 400 on invalid regex, 404 on
+// out-of-range index, 200 with the full updated list on success.
+func handlePutShortcut(w http.ResponseWriter, r *http.Request, index int) {
+	if !requireAuth(w, r) {
+		return
+	}
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, "read request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	var pair [2]string
+	if err := json.Unmarshal(body, &pair); err != nil {
+		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	pattern, err := regexp.Compile(pair[0])
+	if err != nil {
+		http.Error(w, "invalid regex: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	shortcutsMutex.Lock()
+	if index < 0 || index >= len(shortcuts) {
+		shortcutsMutex.Unlock()
+		http.Error(w, "index out of range", http.StatusNotFound)
+		return
+	}
+	shortcuts[index] = shortcut{Pattern: pattern, URL: pair[1]}
+	shortcutsMutex.Unlock()
+
+	if err := saveShortcuts(shortcutsFilePath); err != nil {
+		http.Error(w, "save shortcuts: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	data, err := shortcutsAsJSON()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+// handleDeleteShortcut handles DELETE /shortcuts/{index}. Removes the shortcut at the
+// given index. Returns 404 on out-of-range index, 200 with the full updated list on success.
+func handleDeleteShortcut(w http.ResponseWriter, r *http.Request, index int) {
+	if !requireAuth(w, r) {
+		return
+	}
+
+	shortcutsMutex.Lock()
+	if index < 0 || index >= len(shortcuts) {
+		shortcutsMutex.Unlock()
+		http.Error(w, "index out of range", http.StatusNotFound)
+		return
+	}
+	shortcuts = append(shortcuts[:index], shortcuts[index+1:]...)
+	shortcutsMutex.Unlock()
+
+	if err := saveShortcuts(shortcutsFilePath); err != nil {
+		http.Error(w, "save shortcuts: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	data, err := shortcutsAsJSON()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
+}
+
+// handleShortcutsWithIndex dispatches PUT and DELETE requests for /shortcuts/{index}.
+// It parses the index from the URL path and routes to the appropriate handler.
+func handleShortcutsWithIndex(w http.ResponseWriter, r *http.Request) {
+	// Path is /shortcuts/{index}; strip the /shortcuts/ prefix to get the index string.
+	indexStr := strings.TrimPrefix(r.URL.Path, "/shortcuts/")
+	index, err := strconv.Atoi(indexStr)
+	if err != nil {
+		http.Error(w, "invalid index", http.StatusBadRequest)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		handlePutShortcut(w, r, index)
+	case http.MethodDelete:
+		handleDeleteShortcut(w, r, index)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleShortcuts dispatches GET and POST requests for /shortcuts (no index).
+func handleShortcuts(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		handleGetShortcuts(w, r)
+	case http.MethodPost:
+		handlePostShortcuts(w, r)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// tryShortcut checks the transcript against the loaded shortcuts under a read lock.
+// The first matching shortcut wins: it POSTs an empty body to the shortcut's URL.
+// Returns (true, nil) on a 200 response, (true, err) on a non-200 or network error,
+// and (false, nil) when no shortcut matches.
+func tryShortcut(transcript string) (bool, error) {
+	shortcutsMutex.RLock()
+	defer shortcutsMutex.RUnlock()
+
+	for _, shortcut := range shortcuts {
+		if !shortcut.Pattern.MatchString(transcript) {
+			continue
+		}
+		log.Printf("shortcut matched %q -> %s", shortcut.Pattern, shortcut.URL)
+		response, err := http.Post(shortcut.URL, "", nil)
+		if err != nil {
+			return true, fmt.Errorf("shortcut POST to %s: %w", shortcut.URL, err)
+		}
+		// Drain and close the body immediately; we return right after this block.
+		_, _ = io.Copy(io.Discard, response.Body)
+		response.Body.Close()
+		if response.StatusCode != http.StatusOK {
+			return true, fmt.Errorf("shortcut POST to %s returned status %d", shortcut.URL, response.StatusCode)
+		}
+		return true, nil
+	}
+	return false, nil
+}
 
 func init() {
 	cfg := speech.DetectorConfig{
@@ -243,6 +533,10 @@ func discoverVoicePE() (string, error) {
 }
 
 func main() {
+	// Parse CLI flags before anything else so that -shortcuts is available during startup.
+	flag.StringVar(&shortcutsFilePath, "shortcuts", "", "path to shortcuts JSON file ([regex, url] pairs)")
+	flag.Parse()
+
 	// Validate required env vars before starting anything. These are permanent failures
 	// that cannot be recovered by retrying, so log.Fatalf is appropriate here.
 	elevenLabsAPIKey = os.Getenv("ELEVENLABS_API_KEY")
@@ -258,6 +552,37 @@ func main() {
 	webhookPayload = os.Getenv("WEBHOOK_PAYLOAD")
 	if webhookPayload == "" {
 		log.Fatalf("WEBHOOK_PAYLOAD environment variable is required")
+	}
+
+	if shortcutsFilePath != "" {
+		apiPassword = os.Getenv("API_PASSWORD")
+		if apiPassword == "" {
+			log.Fatalf("API_PASSWORD environment variable is required when -shortcuts is set")
+		}
+
+		if _, err := os.Stat(shortcutsFilePath); os.IsNotExist(err) {
+			// Create an empty shortcuts file so the user has a valid starting point.
+			if err := os.WriteFile(shortcutsFilePath, []byte("[]\n"), 0o644); err != nil {
+				log.Fatalf("create shortcuts file %s: %v", shortcutsFilePath, err)
+			}
+			log.Printf("created empty shortcuts file: %s", shortcutsFilePath)
+		} else {
+			loaded, err := loadShortcuts(shortcutsFilePath)
+			if err != nil {
+				log.Fatalf("load shortcuts from %s: %v", shortcutsFilePath, err)
+			}
+			shortcutsMutex.Lock()
+			shortcuts = loaded
+			shortcutsMutex.Unlock()
+			log.Printf("loaded %d shortcut(s) from %s", len(shortcuts), shortcutsFilePath)
+		}
+
+		// Register CRUD endpoints only when shortcuts are enabled. The /shortcuts/
+		// prefix handler covers PUT and DELETE (which include an index), while the
+		// exact /shortcuts match covers GET and POST.
+		http.HandleFunc("/shortcuts/", handleShortcutsWithIndex)
+		http.HandleFunc("/shortcuts", handleShortcuts)
+		log.Printf("shortcuts CRUD API enabled at /shortcuts")
 	}
 
 	defer func() {
@@ -961,6 +1286,44 @@ func runPipelineResponse(writer io.Writer, audioBuffer []byte, ttsURL string, er
 		{Name: "text", Value: transcript},
 	}); err != nil {
 		return err
+	}
+
+	// Check shortcuts before the webhook. If a shortcut matches, skip the webhook entirely.
+	if matched, err := tryShortcut(transcript); matched {
+		if err != nil {
+			log.Printf("shortcut error: %v", err)
+			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
+				{Name: "code", Value: "pipeline-error"},
+				{Name: "message", Value: err.Error()},
+			}); err != nil {
+				return err
+			}
+			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, nil); err != nil {
+				return err
+			}
+			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, []*api.VoiceAssistantEventData{
+				{Name: "url", Value: errorURL},
+			}); err != nil {
+				return err
+			}
+			return sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
+		}
+		// Shortcut succeeded: play the tone and end the run.
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_INTENT_START, nil); err != nil {
+			return err
+		}
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_INTENT_END, nil); err != nil {
+			return err
+		}
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, nil); err != nil {
+			return err
+		}
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, []*api.VoiceAssistantEventData{
+			{Name: "url", Value: ttsURL},
+		}); err != nil {
+			return err
+		}
+		return sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 	}
 
 	responseText, err := postWebhook(transcript)
