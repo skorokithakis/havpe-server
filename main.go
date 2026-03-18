@@ -255,6 +255,7 @@ func handlePostShortcuts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	shortcutsMutex.Lock()
+	newIndex := len(shortcuts)
 	shortcuts = append(shortcuts, shortcut{Pattern: pattern, URL: pair[1]})
 	shortcutsMutex.Unlock()
 
@@ -262,6 +263,8 @@ func handlePostShortcuts(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "save shortcuts: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("added shortcut at index %d with regex %q", newIndex, pair[0])
 
 	data, err := shortcutsAsJSON()
 	if err != nil {
@@ -310,6 +313,8 @@ func handlePutShortcut(w http.ResponseWriter, r *http.Request, index int) {
 		return
 	}
 
+	log.Printf("updated shortcut at index %d with regex %q", index, pair[0])
+
 	data, err := shortcutsAsJSON()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -332,6 +337,7 @@ func handleDeleteShortcut(w http.ResponseWriter, r *http.Request, index int) {
 		http.Error(w, "index out of range", http.StatusNotFound)
 		return
 	}
+	oldPattern := shortcuts[index].Pattern.String()
 	shortcuts = append(shortcuts[:index], shortcuts[index+1:]...)
 	shortcutsMutex.Unlock()
 
@@ -339,6 +345,8 @@ func handleDeleteShortcut(w http.ResponseWriter, r *http.Request, index int) {
 		http.Error(w, "save shortcuts: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("deleted shortcut at index %d with regex %q", index, oldPattern)
 
 	data, err := shortcutsAsJSON()
 	if err != nil {
@@ -807,7 +815,6 @@ func handleConnection(conn net.Conn, ttsURL string, errorURL string, ttsResponse
 					conn.Close()
 					return
 				}
-				log.Printf("sent PingRequest")
 			}
 		}
 	}()
