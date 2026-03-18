@@ -123,10 +123,13 @@ var ttsAudioBuffer []byte
 var ttsAudioMutex sync.Mutex
 
 // shortcut pairs a compiled regular expression with the URL to POST to when the
-// expression matches a transcript.
+// expression matches a transcript. rawPattern holds the original pattern string
+// (without the (?i) prefix) so it can be written back to disk without accumulating
+// repeated (?i) prefixes across load/save cycles.
 type shortcut struct {
-	Pattern *regexp.Regexp
-	URL     string
+	Pattern    *regexp.Regexp
+	rawPattern string
+	URL        string
 }
 
 // shortcuts is the list of active shortcuts, protected by shortcutsMutex.
@@ -135,17 +138,36 @@ var shortcuts []shortcut
 var shortcutsMutex sync.RWMutex
 
 // shortcutsFilePath is the path to the shortcuts JSON file, set from the -shortcuts
-// flag. It is stored here so saveShortcuts can use it without an argument.
+// flag. It is stored here so the API handlers can pass it to loadShortcuts and
+// saveShortcuts without threading it through every call.
 var shortcutsFilePath string
 
 // apiPassword is the password required for HTTP Basic Auth on the shortcuts CRUD
 // endpoints. Read from API_PASSWORD at startup; required when -shortcuts is set.
 var apiPassword string
 
+// compileShortcutPattern strips all leading (?i) prefixes from raw (to clean up
+// accumulated prefixes from existing files, e.g. "(?i)(?i)(?i)pattern"), then
+// compiles the pattern with a single (?i) prepended so all shortcuts are always
+// case-insensitive. It returns the compiled regexp, the cleaned raw pattern
+// (without any (?i) prefix), and any error.
+func compileShortcutPattern(raw string) (*regexp.Regexp, string, error) {
+	cleaned := raw
+	for strings.HasPrefix(cleaned, "(?i)") {
+		cleaned = strings.TrimPrefix(cleaned, "(?i)")
+	}
+	compiled, err := regexp.Compile("(?i)" + cleaned)
+	if err != nil {
+		return nil, "", err
+	}
+	return compiled, cleaned, nil
+}
+
 // loadShortcuts reads the JSON file at path and returns a slice of compiled shortcuts.
 // The file format is an array of [regex, url] pairs: [["pattern", "https://..."], ...].
 // Returns an error if the file cannot be read, the JSON is malformed, or any regex fails
-// to compile.
+// to compile. The caller must hold shortcutsMutex (or be the only goroutine accessing
+// shortcuts) before calling this function.
 func loadShortcuts(path string) ([]shortcut, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -159,24 +181,23 @@ func loadShortcuts(path string) ([]shortcut, error) {
 
 	result := make([]shortcut, 0, len(raw))
 	for index, pair := range raw {
-		pattern, err := regexp.Compile("(?i)" + pair[0])
+		compiled, cleaned, err := compileShortcutPattern(pair[0])
 		if err != nil {
 			return nil, fmt.Errorf("shortcuts[%d]: compile regex %q: %w", index, pair[0], err)
 		}
-		result = append(result, shortcut{Pattern: pattern, URL: pair[1]})
+		result = append(result, shortcut{Pattern: compiled, rawPattern: cleaned, URL: pair[1]})
 	}
 	return result, nil
 }
 
-// saveShortcuts writes the current shortcuts slice to the file at shortcutsFilePath.
+// saveShortcuts writes the given shortcuts slice to the file at path.
 // The output format matches what loadShortcuts expects: [["pattern", "url"], ...].
-func saveShortcuts(path string) error {
-	shortcutsMutex.RLock()
-	raw := make([][2]string, len(shortcuts))
-	for index, shortcut := range shortcuts {
-		raw[index] = [2]string{shortcut.Pattern.String(), shortcut.URL}
+// The caller must hold shortcutsMutex before calling this function.
+func saveShortcuts(path string, list []shortcut) error {
+	raw := make([][2]string, len(list))
+	for index, s := range list {
+		raw[index] = [2]string{s.rawPattern, s.URL}
 	}
-	shortcutsMutex.RUnlock()
 
 	data, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
@@ -201,15 +222,12 @@ func requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-// shortcutsAsJSON serialises the current shortcuts slice as a [][2]string JSON array.
-// The caller must not hold shortcutsMutex when calling this function.
-func shortcutsAsJSON() ([]byte, error) {
-	shortcutsMutex.RLock()
-	raw := make([][2]string, len(shortcuts))
-	for index, shortcut := range shortcuts {
-		raw[index] = [2]string{shortcut.Pattern.String(), shortcut.URL}
+// shortcutsAsJSON serialises the given shortcuts slice as a [][2]string JSON array.
+func shortcutsAsJSON(list []shortcut) ([]byte, error) {
+	raw := make([][2]string, len(list))
+	for index, s := range list {
+		raw[index] = [2]string{s.rawPattern, s.URL}
 	}
-	shortcutsMutex.RUnlock()
 
 	data, err := json.Marshal(raw)
 	if err != nil {
@@ -218,12 +236,25 @@ func shortcutsAsJSON() ([]byte, error) {
 	return data, nil
 }
 
-// handleGetShortcuts handles GET /shortcuts. Returns the current list as JSON.
+// handleGetShortcuts handles GET /shortcuts. Reads the file from disk, updates the
+// in-memory slice, and returns the current list as JSON.
 func handleGetShortcuts(w http.ResponseWriter, r *http.Request) {
 	if !requireAuth(w, r) {
 		return
 	}
-	data, err := shortcutsAsJSON()
+
+	shortcutsMutex.Lock()
+	loaded, err := loadShortcuts(shortcutsFilePath)
+	if err != nil {
+		shortcutsMutex.Unlock()
+		http.Error(w, "load shortcuts: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	shortcuts = loaded
+	list := loaded
+	shortcutsMutex.Unlock()
+
+	data, err := shortcutsAsJSON(list)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -232,8 +263,9 @@ func handleGetShortcuts(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-// handlePostShortcuts handles POST /shortcuts. Appends a new shortcut from the request
-// body (a ["regex", "url"] pair), saves, and returns 201 with the full updated list.
+// handlePostShortcuts handles POST /shortcuts. Reads the file from disk, appends a new
+// shortcut from the request body (a ["regex", "url"] pair), saves, updates the in-memory
+// slice, and returns 201 with the full updated list.
 func handlePostShortcuts(w http.ResponseWriter, r *http.Request) {
 	if !requireAuth(w, r) {
 		return
@@ -248,25 +280,33 @@ func handlePostShortcuts(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	pattern, err := regexp.Compile(pair[0])
+	compiled, cleaned, err := compileShortcutPattern(pair[0])
 	if err != nil {
 		http.Error(w, "invalid regex: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	shortcutsMutex.Lock()
-	newIndex := len(shortcuts)
-	shortcuts = append(shortcuts, shortcut{Pattern: pattern, URL: pair[1]})
-	shortcutsMutex.Unlock()
-
-	if err := saveShortcuts(shortcutsFilePath); err != nil {
+	loaded, err := loadShortcuts(shortcutsFilePath)
+	if err != nil {
+		shortcutsMutex.Unlock()
+		http.Error(w, "load shortcuts: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	newIndex := len(loaded)
+	loaded = append(loaded, shortcut{Pattern: compiled, rawPattern: cleaned, URL: pair[1]})
+	if err := saveShortcuts(shortcutsFilePath, loaded); err != nil {
+		shortcutsMutex.Unlock()
 		http.Error(w, "save shortcuts: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	shortcuts = loaded
+	list := loaded
+	shortcutsMutex.Unlock()
 
-	log.Printf("added shortcut at index %d with regex %q", newIndex, pair[0])
+	log.Printf("added shortcut at index %d with regex %q", newIndex, cleaned)
 
-	data, err := shortcutsAsJSON()
+	data, err := shortcutsAsJSON(list)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -276,9 +316,10 @@ func handlePostShortcuts(w http.ResponseWriter, r *http.Request) {
 	w.Write(data)
 }
 
-// handlePutShortcut handles PUT /shortcuts/{index}. Replaces the shortcut at the given
-// index with the pair from the request body. Returns 400 on invalid regex, 404 on
-// out-of-range index, 200 with the full updated list on success.
+// handlePutShortcut handles PUT /shortcuts/{index}. Reads the file from disk, replaces
+// the shortcut at the given index with the pair from the request body, saves, updates
+// the in-memory slice, and returns 200 with the full updated list. Returns 400 on invalid
+// regex, 404 on out-of-range index.
 func handlePutShortcut(w http.ResponseWriter, r *http.Request, index int) {
 	if !requireAuth(w, r) {
 		return
@@ -293,29 +334,37 @@ func handlePutShortcut(w http.ResponseWriter, r *http.Request, index int) {
 		http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	pattern, err := regexp.Compile(pair[0])
+	compiled, cleaned, err := compileShortcutPattern(pair[0])
 	if err != nil {
 		http.Error(w, "invalid regex: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
 	shortcutsMutex.Lock()
-	if index < 0 || index >= len(shortcuts) {
+	loaded, err := loadShortcuts(shortcutsFilePath)
+	if err != nil {
+		shortcutsMutex.Unlock()
+		http.Error(w, "load shortcuts: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if index < 0 || index >= len(loaded) {
 		shortcutsMutex.Unlock()
 		http.Error(w, "index out of range", http.StatusNotFound)
 		return
 	}
-	shortcuts[index] = shortcut{Pattern: pattern, URL: pair[1]}
-	shortcutsMutex.Unlock()
-
-	if err := saveShortcuts(shortcutsFilePath); err != nil {
+	loaded[index] = shortcut{Pattern: compiled, rawPattern: cleaned, URL: pair[1]}
+	if err := saveShortcuts(shortcutsFilePath, loaded); err != nil {
+		shortcutsMutex.Unlock()
 		http.Error(w, "save shortcuts: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	shortcuts = loaded
+	list := loaded
+	shortcutsMutex.Unlock()
 
-	log.Printf("updated shortcut at index %d with regex %q", index, pair[0])
+	log.Printf("updated shortcut at index %d with regex %q", index, cleaned)
 
-	data, err := shortcutsAsJSON()
+	data, err := shortcutsAsJSON(list)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -324,31 +373,40 @@ func handlePutShortcut(w http.ResponseWriter, r *http.Request, index int) {
 	w.Write(data)
 }
 
-// handleDeleteShortcut handles DELETE /shortcuts/{index}. Removes the shortcut at the
-// given index. Returns 404 on out-of-range index, 200 with the full updated list on success.
+// handleDeleteShortcut handles DELETE /shortcuts/{index}. Reads the file from disk,
+// removes the shortcut at the given index, saves, updates the in-memory slice, and
+// returns 200 with the full updated list. Returns 404 on out-of-range index.
 func handleDeleteShortcut(w http.ResponseWriter, r *http.Request, index int) {
 	if !requireAuth(w, r) {
 		return
 	}
 
 	shortcutsMutex.Lock()
-	if index < 0 || index >= len(shortcuts) {
+	loaded, err := loadShortcuts(shortcutsFilePath)
+	if err != nil {
+		shortcutsMutex.Unlock()
+		http.Error(w, "load shortcuts: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if index < 0 || index >= len(loaded) {
 		shortcutsMutex.Unlock()
 		http.Error(w, "index out of range", http.StatusNotFound)
 		return
 	}
-	oldPattern := shortcuts[index].Pattern.String()
-	shortcuts = append(shortcuts[:index], shortcuts[index+1:]...)
-	shortcutsMutex.Unlock()
-
-	if err := saveShortcuts(shortcutsFilePath); err != nil {
+	oldPattern := loaded[index].rawPattern
+	loaded = append(loaded[:index], loaded[index+1:]...)
+	if err := saveShortcuts(shortcutsFilePath, loaded); err != nil {
+		shortcutsMutex.Unlock()
 		http.Error(w, "save shortcuts: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
+	shortcuts = loaded
+	list := loaded
+	shortcutsMutex.Unlock()
 
 	log.Printf("deleted shortcut at index %d with regex %q", index, oldPattern)
 
-	data, err := shortcutsAsJSON()
+	data, err := shortcutsAsJSON(list)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
