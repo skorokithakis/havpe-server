@@ -3,16 +3,16 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"mime/multipart"
 	"net"
 	"net/http"
-	"net/textproto"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -23,6 +23,7 @@ import (
 
 	"havpe-server/api"
 
+	"github.com/gorilla/websocket"
 	"github.com/hashicorp/mdns"
 	"github.com/streamer45/silero-vad-go/speech"
 	"google.golang.org/protobuf/proto"
@@ -91,6 +92,15 @@ const speechStartFramesRequired = 3
 // silenceFramesRequired is the number of consecutive non-speech 32ms frames that must
 // follow detected speech before end-of-speech is declared. 1280ms / 32ms = 40 frames.
 const silenceFramesRequired = 40
+
+// sttTranscriptTimeout is how long runPipelineResponse waits for the committed_transcript
+// message from the ElevenLabs WebSocket before giving up and treating it as an error.
+const sttTranscriptTimeout = 10 * time.Second
+
+// elevenLabsSTTWebSocketURL is the ElevenLabs realtime speech-to-text WebSocket endpoint.
+// Query params select the model, language, audio format, and commit strategy. commit_strategy=manual
+// means we control when transcription is finalized by sending a chunk with commit=true.
+const elevenLabsSTTWebSocketURL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&language_code=en&audio_format=pcm_16000&commit_strategy=manual"
 
 // readDeadline is the duration after which a read on the TCP connection times out.
 // Refreshed after every successful ReadFrame call. When the device silently disappears
@@ -532,6 +542,13 @@ type pipelineState struct {
 	// Zero value means no speech has ended yet in this session, in which case startTime
 	// is used for the inter-utterance silence timeout.
 	lastSpeechEndTime time.Time
+	// sttConn is the WebSocket connection to the ElevenLabs realtime STT API.
+	// Opened when the pipeline starts and closed after the transcript is received.
+	// Nil when the pipeline is not active or when running in recording mode.
+	sttConn *websocket.Conn
+	// transcriptChannel receives the committed transcript text from the ElevenLabs
+	// WebSocket reader goroutine. Buffered with capacity 1 so the goroutine never blocks.
+	transcriptChannel chan string
 }
 
 // httpPort is the port on which the HTTP server serves TTS audio files.
@@ -1053,6 +1070,9 @@ func handleVoiceAssistantRequest(writer io.Writer, data []byte, pipeline *pipeli
 
 	if !request.GetStart() {
 		log.Printf("VoiceAssistantRequest start=false: pipeline cancelled by device, resetting state")
+		// Close the WebSocket before zeroing the struct so the readSTTMessages goroutine
+		// unblocks and exits rather than leaking.
+		closeSTTConnection(pipeline)
 		*pipeline = pipelineState{}
 		// The device may be stuck in AWAITING_RESPONSE or another non-idle state after
 		// sending start=false. Sending RUN_END ensures its state machine reaches IDLE and
@@ -1064,14 +1084,43 @@ func handleVoiceAssistantRequest(writer io.Writer, data []byte, pipeline *pipeli
 		request.GetWakeWordPhrase(), request.GetFlags())
 
 	*pipeline = pipelineState{
-		active:    true,
-		startTime: time.Now(),
+		active:            true,
+		startTime:         time.Now(),
+		transcriptChannel: make(chan string, 1),
 	}
 
 	// Reset the VAD detector state so that state from a previous pipeline run does not
 	// bleed into the new one.
 	if err := detector.Reset(); err != nil {
 		log.Printf("reset VAD detector: %v", err)
+	}
+
+	// Open the ElevenLabs realtime STT WebSocket. We do this eagerly so that audio
+	// chunks can be streamed as they arrive rather than batched after end-of-speech.
+	// Recording mode does not use the WebSocket (it saves WAV files instead), so we
+	// skip this when recordDir is set. We also skip when elevenLabsAPIKey is empty,
+	// which happens in tests where main() is never called.
+	if recordDir == "" && elevenLabsAPIKey != "" {
+		sttURL, err := url.Parse(elevenLabsSTTWebSocketURL)
+		if err != nil {
+			// The URL is a compile-time constant, so a parse error is a programming mistake.
+			log.Fatalf("parse ElevenLabs STT WebSocket URL: %v", err)
+		}
+		dialer := websocket.Dialer{}
+		headers := http.Header{}
+		headers.Set("xi-api-key", elevenLabsAPIKey)
+		sttConn, _, err := dialer.Dial(sttURL.String(), headers)
+		if err != nil {
+			log.Printf("open ElevenLabs STT WebSocket: %v", err)
+			// Close the channel immediately so waitForTranscript fails fast rather than
+			// blocking for the full sttTranscriptTimeout.
+			close(pipeline.transcriptChannel)
+		} else {
+			pipeline.sttConn = sttConn
+			// Start the reader goroutine. It reads messages until the connection closes and
+			// sends the first committed_transcript text to transcriptChannel.
+			go readSTTMessages(sttConn, pipeline.transcriptChannel)
+		}
 	}
 
 	// port=0 tells the device to stream audio over the API connection rather than UDP.
@@ -1083,6 +1132,65 @@ func handleVoiceAssistantRequest(writer io.Writer, data []byte, pipeline *pipeli
 		return err
 	}
 	return sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_START, nil)
+}
+
+// closeSTTConnection closes pipeline.sttConn if it is non-nil and nils the field.
+// Closing the connection causes the readSTTMessages goroutine's ReadMessage call to
+// return an error, which unblocks it so it can exit cleanly.
+func closeSTTConnection(pipeline *pipelineState) {
+	if pipeline.sttConn != nil {
+		pipeline.sttConn.Close()
+		pipeline.sttConn = nil
+	}
+}
+
+// readSTTMessages reads messages from the ElevenLabs realtime STT WebSocket until the
+// connection closes. When a committed_transcript message arrives, its text is sent to
+// transcriptChannel and the function returns. If the connection drops before a transcript
+// arrives, the channel is closed so waitForTranscript can fail fast instead of waiting
+// for the full timeout.
+func readSTTMessages(conn *websocket.Conn, transcriptChannel chan string) {
+	for {
+		_, messageBytes, err := conn.ReadMessage()
+		if err != nil {
+			// The connection dropped before a committed_transcript arrived (or was closed
+			// by closeSTTConnection on a non-finalization path like pre-speech timeout).
+			// Closing the channel lets waitForTranscript fail immediately.
+			log.Printf("STT WebSocket read: %v", err)
+			close(transcriptChannel)
+			return
+		}
+
+		var message struct {
+			MessageType string `json:"message_type"`
+			Text        string `json:"text"`
+			Error       string `json:"error"`
+		}
+		if err := json.Unmarshal(messageBytes, &message); err != nil {
+			log.Printf("STT WebSocket: unmarshal message: %v", err)
+			continue
+		}
+
+		if message.Error != "" {
+			log.Printf("STT WebSocket: error from server: type=%q error=%q", message.MessageType, message.Error)
+		}
+
+		switch message.MessageType {
+		case "committed_transcript":
+			log.Printf("STT WebSocket: committed_transcript: %q", message.Text)
+			select {
+			case transcriptChannel <- message.Text:
+			default:
+				// Channel already has a value (shouldn't happen in normal flow, but guard anyway).
+				log.Printf("STT WebSocket: transcriptChannel full, discarding duplicate transcript")
+			}
+			return
+		case "session_started":
+			log.Printf("STT WebSocket: session started")
+		default:
+			log.Printf("STT WebSocket: received message: %s", messageBytes)
+		}
+	}
 }
 
 // handleVoiceAssistantAudio handles message type 106. It accumulates PCM chunks into
@@ -1117,6 +1225,16 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 
 	chunkData := chunk.GetData()
 	pipeline.audioBuffer = append(pipeline.audioBuffer, chunkData...)
+
+	// Stream the chunk to the ElevenLabs realtime STT WebSocket so transcription can
+	// proceed concurrently with VAD processing. On failure, nil out sttConn so subsequent
+	// chunks don't keep trying and spamming the log.
+	if pipeline.sttConn != nil {
+		if !sendSTTChunk(pipeline.sttConn, chunkData, false) {
+			pipeline.sttConn = nil
+		}
+	}
+
 	// Prepend any leftover bytes from the previous chunk, then process complete VAD windows.
 	// Each window is vadFrameSize bytes (512 samples at 16kHz, 16-bit LE = 32ms of audio).
 	// Infer() requires exactly 512 samples per call and maintains RNN state across calls,
@@ -1161,7 +1279,14 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 				log.Printf("VAD end-of-speech detected after %d silence frames, finalising pipeline",
 					pipeline.consecutiveSilenceFrames)
 				pipeline.active = false
-				return runPipelineResponse(writer, pipeline.audioBuffer, ttsURL, errorURL, ttsResponseURL)
+				// Commit the transcript: send a final chunk with commit=true so ElevenLabs
+				// finalizes transcription. An empty audio payload is fine for the commit message.
+				if pipeline.sttConn != nil {
+					if !sendSTTChunk(pipeline.sttConn, nil, true) {
+						pipeline.sttConn = nil
+					}
+				}
+				return runPipelineResponse(writer, pipeline, ttsURL, errorURL, ttsResponseURL)
 			}
 		}
 	}
@@ -1171,6 +1296,10 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 	if !pipeline.speechDetected && elapsed >= preSpeechTimeout {
 		log.Printf("no speech detected after %v, aborting pipeline", preSpeechTimeout)
 		pipeline.active = false
+		// No transcript will ever arrive, so close the WebSocket now to unblock the
+		// readSTTMessages goroutine rather than leaving it running until the connection
+		// is eventually dropped by the server.
+		closeSTTConnection(pipeline)
 		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
 			{Name: "code", Value: "stt-no-text-recognized"},
 			{Name: "message", Value: "No speech detected"},
@@ -1184,7 +1313,13 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 		// Hard safety cap: finalize even if VAD never triggered end-of-speech.
 		log.Printf("audio capture window elapsed, finalising pipeline")
 		pipeline.active = false
-		return runPipelineResponse(writer, pipeline.audioBuffer, ttsURL, errorURL, ttsResponseURL)
+		// Commit the transcript even on the hard cap so ElevenLabs finalizes what it has.
+		if pipeline.sttConn != nil {
+			if !sendSTTChunk(pipeline.sttConn, nil, true) {
+				pipeline.sttConn = nil
+			}
+		}
+		return runPipelineResponse(writer, pipeline, ttsURL, errorURL, ttsResponseURL)
 	}
 
 	return nil
@@ -1354,68 +1489,54 @@ func buildWAV(pcmData []byte) []byte {
 	return wavBuffer.Bytes()
 }
 
-// transcribeAudio builds a WAV file in memory from the raw PCM audio buffer and sends it
-// to the ElevenLabs speech-to-text API. It returns the transcript text on success.
-func transcribeAudio(audioBuffer []byte) (string, error) {
-	wavBytes := buildWAV(audioBuffer)
-
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-
-	if err := writer.WriteField("model_id", "scribe_v2"); err != nil {
-		return "", fmt.Errorf("write model_id field: %w", err)
+// sendSTTChunk sends a single PCM audio chunk to the ElevenLabs realtime STT WebSocket.
+// When commit is true, the message signals ElevenLabs to finalize transcription. Returns
+// true on success, false on any error (which is also logged). The caller should nil out
+// pipeline.sttConn on false to avoid log spam from subsequent failed sends.
+func sendSTTChunk(conn *websocket.Conn, audioData []byte, commit bool) bool {
+	message := struct {
+		MessageType string `json:"message_type"`
+		AudioBase64 string `json:"audio_base_64"`
+		Commit      bool   `json:"commit"`
+		SampleRate  int    `json:"sample_rate"`
+	}{
+		MessageType: "input_audio_chunk",
+		AudioBase64: base64.StdEncoding.EncodeToString(audioData),
+		Commit:      commit,
+		SampleRate:  16000,
 	}
-	if err := writer.WriteField("language_code", "en"); err != nil {
-		return "", fmt.Errorf("write language_code field: %w", err)
-	}
-
-	// The file part requires explicit Content-Type because multipart.Writer defaults to
-	// application/octet-stream, which ElevenLabs may reject.
-	fileHeader := make(textproto.MIMEHeader)
-	fileHeader.Set("Content-Disposition", `form-data; name="file"; filename="audio.wav"`)
-	fileHeader.Set("Content-Type", "audio/wav")
-	filePart, err := writer.CreatePart(fileHeader)
+	messageBytes, err := json.Marshal(message)
 	if err != nil {
-		return "", fmt.Errorf("create file part: %w", err)
+		log.Printf("sendSTTChunk: marshal message: %v", err)
+		return false
 	}
-	if _, err := filePart.Write(wavBytes); err != nil {
-		return "", fmt.Errorf("write WAV to multipart: %w", err)
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	if err := conn.WriteMessage(websocket.TextMessage, messageBytes); err != nil {
+		log.Printf("sendSTTChunk: write message: %v", err)
+		return false
 	}
+	return true
+}
 
-	if err := writer.Close(); err != nil {
-		return "", fmt.Errorf("close multipart writer: %w", err)
+// waitForTranscript waits up to sttTranscriptTimeout for the committed transcript from the
+// ElevenLabs realtime STT WebSocket. Returns the transcript text, or an error if the
+// timeout elapses, the channel is closed (connection dropped), or the pipeline has no
+// transcript channel.
+func waitForTranscript(pipeline *pipelineState) (string, error) {
+	if pipeline.transcriptChannel == nil {
+		return "", fmt.Errorf("no STT transcript channel (pipeline not initialized)")
 	}
-
-	request, err := http.NewRequest("POST", "https://api.elevenlabs.io/v1/speech-to-text", &body)
-	if err != nil {
-		return "", fmt.Errorf("create STT request: %w", err)
+	select {
+	case transcript, ok := <-pipeline.transcriptChannel:
+		if !ok {
+			// Channel was closed by readSTTMessages because the connection dropped before
+			// a committed_transcript arrived.
+			return "", fmt.Errorf("STT WebSocket connection closed before transcript arrived")
+		}
+		return transcript, nil
+	case <-time.After(sttTranscriptTimeout):
+		return "", fmt.Errorf("timed out waiting for STT transcript after %v", sttTranscriptTimeout)
 	}
-	request.Header.Set("Content-Type", writer.FormDataContentType())
-	request.Header.Set("xi-api-key", elevenLabsAPIKey)
-
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		return "", fmt.Errorf("STT request: %w", err)
-	}
-	defer response.Body.Close()
-
-	responseBody, err := io.ReadAll(response.Body)
-	if err != nil {
-		return "", fmt.Errorf("read STT response body: %w", err)
-	}
-
-	if response.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("STT API returned status %d: %s", response.StatusCode, responseBody)
-	}
-
-	var result struct {
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(responseBody, &result); err != nil {
-		return "", fmt.Errorf("parse STT response: %w", err)
-	}
-
-	return result.Text, nil
 }
 
 // postWebhook sends the transcript to the configured webhook URL as a JSON POST request.
@@ -1459,22 +1580,25 @@ func postWebhook(transcript string) (string, error) {
 	return result.Response, nil
 }
 
-// runPipelineResponse transcribes the audio, posts the transcript to the webhook, and
-// sends the remaining pipeline events to the device. When the webhook returns a non-empty
-// response text, it is synthesized to speech and the device plays ttsResponseURL; otherwise
-// the device plays ttsURL (tone.wav). On any failure it plays errorURL with a VOICE_ASSISTANT_ERROR event.
-// On the first write error, it stops sending further events and returns immediately.
-func runPipelineResponse(writer io.Writer, audioBuffer []byte, ttsURL string, errorURL string, ttsResponseURL string) error {
+// runPipelineResponse waits for the committed transcript from the ElevenLabs realtime STT
+// WebSocket, posts it to the webhook, and sends the remaining pipeline events to the device.
+// When the webhook returns a non-empty response text, it is synthesized to speech and the
+// device plays ttsResponseURL; otherwise the device plays ttsURL (tone.wav). On any failure
+// it plays errorURL with a VOICE_ASSISTANT_ERROR event. On the first write error, it stops
+// sending further events and returns immediately.
+func runPipelineResponse(writer io.Writer, pipeline *pipelineState, ttsURL string, errorURL string, ttsResponseURL string) error {
 	if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_VAD_END, nil); err != nil {
 		return err
 	}
 
-	transcript, err := transcribeAudio(audioBuffer)
-	if err != nil {
-		log.Printf("transcribeAudio error: %v", err)
+	transcript, transcriptErr := waitForTranscript(pipeline)
+	closeSTTConnection(pipeline)
+
+	if transcriptErr != nil {
+		log.Printf("STT error: %v", transcriptErr)
 		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
 			{Name: "code", Value: "pipeline-error"},
-			{Name: "message", Value: err.Error()},
+			{Name: "message", Value: transcriptErr.Error()},
 		}); err != nil {
 			return err
 		}
