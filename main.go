@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/textproto"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -141,6 +142,16 @@ var shortcutsMutex sync.RWMutex
 // flag. It is stored here so the API handlers can pass it to loadShortcuts and
 // saveShortcuts without threading it through every call.
 var shortcutsFilePath string
+
+// recordDir is the directory path set from the -record-dir flag. When non-empty,
+// the server operates in recording mode: utterances are saved as WAV files to this
+// directory and the ElevenLabs/webhook env vars are not required.
+var recordDir string
+
+// recordingFileCounter is the global sequential file number for recorded utterances.
+// It persists across pipeline triggers so that files are numbered continuously across
+// multiple wake-word activations (001.wav, 002.wav, ...).
+var recordingFileCounter int
 
 // apiPassword is the password required for HTTP Basic Auth on the shortcuts CRUD
 // endpoints. Read from API_PASSWORD at startup; required when -shortcuts is set.
@@ -517,6 +528,10 @@ type pipelineState struct {
 	// consecutiveSilenceFrames counts how many consecutive non-speech frames have been
 	// seen since the last speech frame. Reset to zero whenever a speech frame arrives.
 	consecutiveSilenceFrames int
+	// lastSpeechEndTime is when the last end-of-speech was detected in recording mode.
+	// Zero value means no speech has ended yet in this session, in which case startTime
+	// is used for the inter-utterance silence timeout.
+	lastSpeechEndTime time.Time
 }
 
 // httpPort is the port on which the HTTP server serves TTS audio files.
@@ -599,25 +614,35 @@ func discoverVoicePE() (string, error) {
 }
 
 func main() {
-	// Parse CLI flags before anything else so that -shortcuts is available during startup.
+	// Parse CLI flags before anything else so that -shortcuts and -record-dir are
+	// available during startup.
 	flag.StringVar(&shortcutsFilePath, "shortcuts", "", "path to shortcuts JSON file ([regex, url] pairs)")
+	flag.StringVar(&recordDir, "record-dir", "", "path to directory for recording utterances as WAV files")
 	flag.Parse()
 
 	// Validate required env vars before starting anything. These are permanent failures
 	// that cannot be recovered by retrying, so log.Fatalf is appropriate here.
-	elevenLabsAPIKey = os.Getenv("ELEVENLABS_API_KEY")
-	if elevenLabsAPIKey == "" {
-		log.Fatalf("ELEVENLABS_API_KEY environment variable is required")
-	}
+	// In recording mode the ElevenLabs and webhook vars are unused, so we skip them.
+	if recordDir == "" {
+		elevenLabsAPIKey = os.Getenv("ELEVENLABS_API_KEY")
+		if elevenLabsAPIKey == "" {
+			log.Fatalf("ELEVENLABS_API_KEY environment variable is required")
+		}
 
-	webhookURL = os.Getenv("WEBHOOK_URL")
-	if webhookURL == "" {
-		log.Fatalf("WEBHOOK_URL environment variable is required")
-	}
+		webhookURL = os.Getenv("WEBHOOK_URL")
+		if webhookURL == "" {
+			log.Fatalf("WEBHOOK_URL environment variable is required")
+		}
 
-	webhookPayload = os.Getenv("WEBHOOK_PAYLOAD")
-	if webhookPayload == "" {
-		log.Fatalf("WEBHOOK_PAYLOAD environment variable is required")
+		webhookPayload = os.Getenv("WEBHOOK_PAYLOAD")
+		if webhookPayload == "" {
+			log.Fatalf("WEBHOOK_PAYLOAD environment variable is required")
+		}
+	} else {
+		if err := os.MkdirAll(recordDir, 0o755); err != nil {
+			log.Fatalf("create record directory %s: %v", recordDir, err)
+		}
+		log.Printf("recording mode active: utterances will be saved to %s", recordDir)
 	}
 
 	if shortcutsFilePath != "" {
@@ -1072,6 +1097,10 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 		return nil
 	}
 
+	if recordDir != "" {
+		return handleRecordingAudio(writer, data, pipeline)
+	}
+
 	var chunk api.VoiceAssistantAudio
 	if err := proto.Unmarshal(data, &chunk); err != nil {
 		log.Printf("unmarshal VoiceAssistantAudio: %v", err)
@@ -1161,16 +1190,126 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 	return nil
 }
 
-// transcribeAudio builds a WAV file in memory from the raw PCM audio buffer and sends it
-// to the ElevenLabs speech-to-text API. It returns the transcript text on success.
-func transcribeAudio(audioBuffer []byte) (string, error) {
+// interUtteranceSilenceTimeout is how long to wait between utterances in recording mode
+// before ending the session. This replaces the normal preSpeechTimeout for the
+// inter-utterance gap, and is longer to give the speaker time to pause between words.
+const interUtteranceSilenceTimeout = 5 * time.Second
+
+// handleRecordingAudio handles audio chunks in recording mode. It buffers all audio for
+// the entire session and writes one WAV file when the session ends. VAD is used only to
+// track when speech last ended, for the inter-utterance silence timeout. The session ends
+// after 5 seconds of silence since the last end-of-speech (or since session start if no
+// speech has been detected yet).
+func handleRecordingAudio(writer io.Writer, data []byte, pipeline *pipelineState) error {
+	var chunk api.VoiceAssistantAudio
+	if err := proto.Unmarshal(data, &chunk); err != nil {
+		log.Printf("unmarshal VoiceAssistantAudio: %v", err)
+		return nil
+	}
+
+	if !pipeline.vadStartSent {
+		log.Printf("first audio chunk received in recording mode, sending STT_VAD_START")
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_VAD_START, nil); err != nil {
+			return err
+		}
+		pipeline.vadStartSent = true
+	}
+
+	chunkData := chunk.GetData()
+	pipeline.audioBuffer = append(pipeline.audioBuffer, chunkData...)
+	// Same VAD frame processing as the normal pipeline: feed 1024-byte windows to the
+	// detector and track consecutive speech/silence frames.
+	pipeline.vadFrameBuffer = append(pipeline.vadFrameBuffer, chunkData...)
+	for len(pipeline.vadFrameBuffer) >= vadFrameSize {
+		frame := pipeline.vadFrameBuffer[:vadFrameSize]
+		pipeline.vadFrameBuffer = pipeline.vadFrameBuffer[vadFrameSize:]
+
+		samples := make([]float32, vadFrameSize/2)
+		for i := range samples {
+			sample := int16(binary.LittleEndian.Uint16(frame[i*2 : i*2+2]))
+			samples[i] = float32(sample) / 32768.0
+		}
+
+		probability, err := detector.Infer(samples)
+		if err != nil {
+			log.Printf("VAD infer error: %v", err)
+			continue
+		}
+
+		if !pipeline.speechDetected {
+			if probability >= speechStartThreshold {
+				pipeline.consecutiveSpeechFrames++
+				if pipeline.consecutiveSpeechFrames >= speechStartFramesRequired {
+					pipeline.speechDetected = true
+					pipeline.consecutiveSilenceFrames = 0
+					log.Printf("speech start detected after %d consecutive frames", pipeline.consecutiveSpeechFrames)
+				}
+			} else {
+				pipeline.consecutiveSpeechFrames = 0
+			}
+			continue
+		}
+
+		if probability >= speechContinueThreshold {
+			pipeline.consecutiveSilenceFrames = 0
+		} else {
+			pipeline.consecutiveSilenceFrames++
+			if pipeline.consecutiveSilenceFrames >= silenceFramesRequired {
+				log.Printf("VAD end-of-speech detected after %d silence frames", pipeline.consecutiveSilenceFrames)
+				// Record when speech ended so the silence timeout is measured from here.
+				// audioBuffer and vadFrameBuffer are intentionally kept intact — the whole
+				// session is saved as one WAV at the end, not per utterance.
+				pipeline.lastSpeechEndTime = time.Now()
+				pipeline.speechDetected = false
+				pipeline.consecutiveSpeechFrames = 0
+				pipeline.consecutiveSilenceFrames = 0
+			}
+		}
+	}
+
+	// Check the inter-utterance silence timeout. We only apply this when no speech has
+	// been detected since the last end-of-speech (i.e. we are in a silence gap).
+	// Once speech starts again, we wait for the next end-of-speech via the VAD loop above.
+	if !pipeline.speechDetected {
+		// Use lastSpeechEndTime if speech has ended at least once; otherwise use
+		// startTime so a session with no speech at all also times out.
+		referenceTime := pipeline.lastSpeechEndTime
+		if referenceTime.IsZero() {
+			referenceTime = pipeline.startTime
+		}
+		if time.Since(referenceTime) >= interUtteranceSilenceTimeout {
+			log.Printf("inter-utterance silence timeout after %v, ending session", interUtteranceSilenceTimeout)
+			// Only write a file if we actually captured speech. A session that times
+			// out with pure silence (e.g. accidental trigger) produces no WAV.
+			if !pipeline.lastSpeechEndTime.IsZero() {
+				filename := fmt.Sprintf("%03d.wav", recordingFileCounter+1)
+				filePath := filepath.Join(recordDir, filename)
+				if err := os.WriteFile(filePath, buildWAV(pipeline.audioBuffer), 0o644); err != nil {
+					log.Printf("write WAV file %s: %v", filePath, err)
+				} else {
+					recordingFileCounter++
+					log.Printf("saved session recording to %s", filePath)
+				}
+			}
+			pipeline.active = false
+			return sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
+		}
+	}
+
+	return nil
+}
+
+// buildWAV wraps raw 16-bit signed LE PCM data (16kHz, mono) in a standard RIFF/WAVE
+// header and returns the complete WAV file as a byte slice. The header constants match
+// the audio format produced by the ESPHome voice assistant pipeline.
+func buildWAV(pcmData []byte) []byte {
 	const (
 		sampleRate    = 16000
 		channels      = 1
 		bitsPerSample = 16
 		audioFormat   = 1 // PCM
 	)
-	dataSize := uint32(len(audioBuffer))
+	dataSize := uint32(len(pcmData))
 	byteRate := uint32(sampleRate * channels * bitsPerSample / 8)
 	blockAlign := uint16(channels * bitsPerSample / 8)
 
@@ -1208,12 +1347,17 @@ func transcribeAudio(audioBuffer []byte) (string, error) {
 	}
 
 	var wavBuffer bytes.Buffer
-	if err := binary.Write(&wavBuffer, binary.LittleEndian, header); err != nil {
-		return "", fmt.Errorf("write WAV header: %w", err)
-	}
-	if _, err := wavBuffer.Write(audioBuffer); err != nil {
-		return "", fmt.Errorf("write PCM data: %w", err)
-	}
+	// binary.Write errors only when the destination writer fails or the value is not
+	// a fixed-size type. Both conditions are impossible here, so we ignore the error.
+	_ = binary.Write(&wavBuffer, binary.LittleEndian, header)
+	_, _ = wavBuffer.Write(pcmData)
+	return wavBuffer.Bytes()
+}
+
+// transcribeAudio builds a WAV file in memory from the raw PCM audio buffer and sends it
+// to the ElevenLabs speech-to-text API. It returns the transcript text on success.
+func transcribeAudio(audioBuffer []byte) (string, error) {
+	wavBytes := buildWAV(audioBuffer)
 
 	var body bytes.Buffer
 	writer := multipart.NewWriter(&body)
@@ -1234,7 +1378,7 @@ func transcribeAudio(audioBuffer []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("create file part: %w", err)
 	}
-	if _, err := filePart.Write(wavBuffer.Bytes()); err != nil {
+	if _, err := filePart.Write(wavBytes); err != nil {
 		return "", fmt.Errorf("write WAV to multipart: %w", err)
 	}
 

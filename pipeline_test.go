@@ -225,10 +225,82 @@ func TestHandleVoiceAssistantAudio_vadEndOfSpeechFinalises(t *testing.T) {
 	}
 }
 
-// TestBuildWAVHeader verifies that transcribeAudio builds a valid WAV in memory by
-// checking the header structure. We use a mock HTTP server to avoid hitting the real
-// ElevenLabs API — the test only cares about WAV construction, not the API call.
-// Since transcribeAudio combines WAV building and API call, we test the WAV header
-// indirectly by verifying the buildWAV helper produces correct output.
-// For now, this test is removed since transcribeAudio is not easily unit-testable
-// without extracting the WAV building into a separate function.
+// TestBuildWAV verifies that buildWAV produces a correctly-structured RIFF/WAVE file.
+// The WAV header fields are checked against the expected values for 16kHz mono 16-bit PCM.
+func TestBuildWAV(t *testing.T) {
+	pcm := make([]byte, 3200) // 100ms of silence at 16kHz 16-bit mono
+	for i := range pcm {
+		pcm[i] = byte(i % 256)
+	}
+
+	wav := buildWAV(pcm)
+
+	// Minimum WAV file is 44-byte header + PCM data.
+	if len(wav) != 44+len(pcm) {
+		t.Fatalf("WAV length: got %d, want %d", len(wav), 44+len(pcm))
+	}
+
+	// RIFF chunk ID.
+	if string(wav[0:4]) != "RIFF" {
+		t.Errorf("ChunkID: got %q, want %q", wav[0:4], "RIFF")
+	}
+	// WAVE format marker.
+	if string(wav[8:12]) != "WAVE" {
+		t.Errorf("Format: got %q, want %q", wav[8:12], "WAVE")
+	}
+	// fmt subchunk ID.
+	if string(wav[12:16]) != "fmt " {
+		t.Errorf("Subchunk1ID: got %q, want %q", wav[12:16], "fmt ")
+	}
+	// data subchunk ID.
+	if string(wav[36:40]) != "data" {
+		t.Errorf("Subchunk2ID: got %q, want %q", wav[36:40], "data")
+	}
+
+	// PCM data must be appended verbatim after the 44-byte header.
+	if !bytes.Equal(wav[44:], pcm) {
+		t.Error("PCM data in WAV does not match input")
+	}
+}
+
+// TestHandleRecordingAudio_interUtteranceSilenceTimeout verifies that the session ends
+// when no speech is detected within interUtteranceSilenceTimeout of the session start.
+// lastSpeechEndTime is zero so startTime is used as the reference for the timeout.
+func TestHandleRecordingAudio_interUtteranceSilenceTimeout(t *testing.T) {
+	// Point recordDir at a temp directory so the WAV write on session end succeeds.
+	tmpDir := t.TempDir()
+	origRecordDir := recordDir
+	recordDir = tmpDir
+	defer func() { recordDir = origRecordDir }()
+
+	conn := &nullConn{}
+	pipeline := &pipelineState{
+		active:    true,
+		startTime: time.Now().Add(-(interUtteranceSilenceTimeout + time.Millisecond)),
+	}
+
+	// Send a small silent chunk — not enough to trigger VAD speech detection.
+	chunk := makeZeroFrame(32)
+	handleRecordingAudio(conn, marshalAudioChunk(t, chunk), pipeline)
+
+	if pipeline.active {
+		t.Error("pipeline should be inactive after inter-utterance silence timeout")
+	}
+}
+
+// TestHandleRecordingAudio_inactivePipelineIgnoredByParent verifies that the parent
+// handleVoiceAssistantAudio drops audio when the pipeline is inactive, even in recording mode.
+func TestHandleRecordingAudio_inactivePipelineIgnoredByParent(t *testing.T) {
+	origRecordDir := recordDir
+	recordDir = "/tmp"
+	defer func() { recordDir = origRecordDir }()
+
+	conn := &nullConn{}
+	pipeline := &pipelineState{active: false}
+
+	handleVoiceAssistantAudio(conn, marshalAudioChunk(t, []byte{0x01, 0x02}), pipeline, "", "", "")
+
+	if len(pipeline.audioBuffer) != 0 {
+		t.Errorf("audioBuffer should be empty when pipeline is inactive, got %d bytes", len(pipeline.audioBuffer))
+	}
+}

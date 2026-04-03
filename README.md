@@ -86,6 +86,45 @@ with any username and `API_PASSWORD` as the password.
 Changes are persisted to the shortcuts file immediately after each write.
 
 
+## Recording mode
+
+Recording mode captures raw audio from the device and saves it as WAV files
+for later use (e.g. as training data). In this mode the ElevenLabs and webhook
+environment variables are not required.
+
+```bash
+docker run --network host \
+  -v ./recordings:/app/recordings \
+  ghcr.io/skorokithakis/havpe-server \
+  -record-dir /app/recordings
+```
+
+Each wake-word trigger produces a single WAV file containing the full session
+audio. The session ends automatically after 5 seconds of silence. Files are
+numbered sequentially across sessions (`001.wav`, `002.wav`, ...).
+
+**Note:** You should add `micro_wake_word.stop:` to `on_start` and
+`micro_wake_word.start:` to `on_end` in your ESPHome YAML to prevent the
+wake word model from falsely triggering during recording and killing the
+session. Also ensure `silence_detection: false` is set on the
+`voice_assistant.start` action.
+
+### Segmenting recordings
+
+The `segment.py` script splits a session WAV into individual utterances using
+Silero VAD. It requires [uv](https://docs.astral.sh/uv/) (dependencies are
+installed automatically on first run).
+
+```bash
+./segment.py recording.wav output_dir/
+```
+
+Files are numbered sequentially (`001.wav`, `002.wav`, ...). If the output
+directory already contains numbered files, numbering continues from the
+highest existing number. Use `--padding-ms` to control how much silence to
+keep around each segment (default: 200ms).
+
+
 ## Running
 
 ### Docker
