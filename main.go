@@ -1150,6 +1150,9 @@ func closeSTTConnection(pipeline *pipelineState) {
 // arrives, the channel is closed so waitForTranscript can fail fast instead of waiting
 // for the full timeout.
 func readSTTMessages(conn *websocket.Conn, transcriptChannel chan string) {
+	// Short voice commands sometimes produce partial_transcript messages but an empty
+	// committed_transcript. We track the last partial so we can fall back to it.
+	lastPartialText := ""
 	for {
 		_, messageBytes, err := conn.ReadMessage()
 		if err != nil {
@@ -1177,14 +1180,25 @@ func readSTTMessages(conn *websocket.Conn, transcriptChannel chan string) {
 
 		switch message.MessageType {
 		case "committed_transcript":
-			log.Printf("STT WebSocket: committed_transcript: %q", message.Text)
+			text := message.Text
+			if text == "" {
+				text = lastPartialText
+				log.Printf("STT WebSocket: committed_transcript empty, falling back to last partial: %q", text)
+			} else {
+				log.Printf("STT WebSocket: committed_transcript: %q", text)
+			}
 			select {
-			case transcriptChannel <- message.Text:
+			case transcriptChannel <- text:
 			default:
 				// Channel already has a value (shouldn't happen in normal flow, but guard anyway).
 				log.Printf("STT WebSocket: transcriptChannel full, discarding duplicate transcript")
 			}
 			return
+		case "partial_transcript":
+			if message.Text != "" {
+				lastPartialText = message.Text
+			}
+			log.Printf("STT WebSocket: received message: %s", messageBytes)
 		case "session_started":
 			log.Printf("STT WebSocket: session started")
 		default:
