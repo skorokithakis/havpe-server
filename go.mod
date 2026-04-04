@@ -1,4 +1,4 @@
-module havpe-server
+module github.com/skorokithakis/havpe-server
 
 go 1.25.3
 

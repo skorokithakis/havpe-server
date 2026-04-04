@@ -1,4 +1,4 @@
-package main
+package esphome
 
 import (
 	"bytes"
@@ -7,10 +7,9 @@ import (
 	"testing"
 )
 
-// buildFrame manually constructs a raw plaintext ESPHome frame for use in tests.
 func buildFrame(messageType uint32, body []byte) []byte {
 	var buf bytes.Buffer
-	buf.WriteByte(plaintextPreamble)
+	buf.WriteByte(PlaintextPreamble)
 	varintBuf := make([]byte, binary.MaxVarintLen64)
 	buf.Write(varintBuf[:binary.PutUvarint(varintBuf, uint64(len(body)))])
 	buf.Write(varintBuf[:binary.PutUvarint(varintBuf, uint64(messageType))])
@@ -50,7 +49,6 @@ func TestReadFrame_emptyBody(t *testing.T) {
 }
 
 func TestReadFrame_badPreamble(t *testing.T) {
-	// 0x01 is the noise/encrypted preamble — must be rejected.
 	raw := []byte{0x01, 0x00, 0x01}
 	_, _, err := ReadFrame(bytes.NewReader(raw))
 	if err == nil {
@@ -66,13 +64,12 @@ func TestReadFrame_truncatedAfterPreamble(t *testing.T) {
 }
 
 func TestReadFrame_truncatedBody(t *testing.T) {
-	// Claim body length 5 but only provide 2 bytes.
 	var buf bytes.Buffer
-	buf.WriteByte(plaintextPreamble)
+	buf.WriteByte(PlaintextPreamble)
 	varintBuf := make([]byte, binary.MaxVarintLen64)
 	buf.Write(varintBuf[:binary.PutUvarint(varintBuf, 5)])
 	buf.Write(varintBuf[:binary.PutUvarint(varintBuf, 1)])
-	buf.Write([]byte{0xAA, 0xBB}) // only 2 of the promised 5 bytes
+	buf.Write([]byte{0xAA, 0xBB})
 
 	_, _, err := ReadFrame(&buf)
 	if err == nil {
@@ -119,7 +116,6 @@ func TestWriteFrame_emptyBody(t *testing.T) {
 }
 
 func TestWriteFrame_largeMessageType(t *testing.T) {
-	// Message types above 127 require multi-byte varints.
 	body := []byte{0xFF}
 	var buf bytes.Buffer
 	if err := WriteFrame(&buf, 300, body); err != nil {
@@ -145,7 +141,6 @@ func TestWriteFrame_writeError(t *testing.T) {
 	}
 }
 
-// errorWriter always returns an error on Write.
 type errorWriter struct{}
 
 func (errorWriter) Write(_ []byte) (int, error) {
@@ -153,7 +148,6 @@ func (errorWriter) Write(_ []byte) (int, error) {
 }
 
 func TestReadFrame_multipleFrames(t *testing.T) {
-	// Verify that sequential frames on the same reader are decoded independently.
 	var buf bytes.Buffer
 	frames := []struct {
 		messageType uint32

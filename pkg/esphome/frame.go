@@ -1,4 +1,4 @@
-package main
+package esphome
 
 import (
 	"bufio"
@@ -7,17 +7,12 @@ import (
 	"io"
 )
 
-const plaintextPreamble = 0x00
+const PlaintextPreamble = 0x00
 
 // ReadFrame reads one plaintext ESPHome native API frame from reader.
 // The frame format is: preamble (0x00) | size varint | type varint | body bytes.
 // Returns the message type ID and the raw protobuf body bytes.
 func ReadFrame(reader io.Reader) (messageType uint32, data []byte, err error) {
-	// encoding/binary.ReadUvarint requires an io.ByteReader. Wrap in bufio.Reader
-	// only when necessary so callers that already pass a bufio.Reader don't pay
-	// double-buffering costs. We keep a reference to the io.Reader side of the
-	// (possibly wrapped) reader so that io.ReadFull for the body drains from the
-	// same buffer as the varint reads above.
 	fullReader := reader
 	byteReader, ok := reader.(io.ByteReader)
 	if !ok {
@@ -30,7 +25,7 @@ func ReadFrame(reader io.Reader) (messageType uint32, data []byte, err error) {
 	if err != nil {
 		return 0, nil, fmt.Errorf("reading preamble: %w", err)
 	}
-	if preamble != plaintextPreamble {
+	if preamble != PlaintextPreamble {
 		return 0, nil, fmt.Errorf("unexpected preamble byte 0x%02x (noise/encrypted frames are not supported)", preamble)
 	}
 
@@ -53,18 +48,11 @@ func ReadFrame(reader io.Reader) (messageType uint32, data []byte, err error) {
 }
 
 // WriteFrame writes one plaintext ESPHome native API frame to writer.
-// The frame format is: preamble (0x00) | size varint | type varint | body bytes.
-//
 // The entire frame is assembled into a single slice before calling writer.Write
-// once. This is essential for correctness when writer is a lockedWriter: two
-// separate Write calls (header then body) would release and re-acquire the lock
-// between them, allowing a concurrent goroutine to interleave its bytes and
-// corrupt the stream.
+// once, which is essential when writer is a LockedWriter to prevent interleaving.
 func WriteFrame(writer io.Writer, messageType uint32, data []byte) error {
-	// Pre-allocate a buffer large enough for the worst case: preamble (1) +
-	// two varints (up to 10 bytes each) + body.
 	frame := make([]byte, 1+binary.MaxVarintLen64+binary.MaxVarintLen64+len(data))
-	frame[0] = plaintextPreamble
+	frame[0] = PlaintextPreamble
 	offset := 1
 	offset += binary.PutUvarint(frame[offset:], uint64(len(data)))
 	offset += binary.PutUvarint(frame[offset:], uint64(messageType))

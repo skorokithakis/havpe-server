@@ -1,6 +1,6 @@
 syntax = "proto3";
 
-option go_package = "havpe-server/api";
+option go_package = "github.com/skorokithakis/havpe-server/pkg/esphome/api";
 
 import "api_options.proto";
 
