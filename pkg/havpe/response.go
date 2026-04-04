@@ -42,16 +42,23 @@ func (s *Server) runPipelineResponse(writer io.Writer) error {
 	}
 
 	req := &processors.TranscriptRequest{Transcript: transcript}
-	resp := &processors.TranscriptResponse{}
+	var resp *processors.TranscriptResponse
 
 	for _, p := range s.processors {
-		if err := p.Process(req, resp); err != nil {
+		r, err := p.Process(req)
+		if err != nil {
 			log.Printf("processor error: %v", err)
 			return s.sendErrorAndEnd(writer, "pipeline-error", err.Error())
 		}
-		if resp.StopProcessing {
+		if r != nil {
+			resp = r
+		}
+		if resp != nil && resp.StopProcessing {
 			break
 		}
+	}
+	if resp == nil {
+		resp = &processors.TranscriptResponse{}
 	}
 
 	playbackURL := s.ToneURL

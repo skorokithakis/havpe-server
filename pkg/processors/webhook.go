@@ -24,32 +24,33 @@ func NewWebhookProcessor(url, payload string) *WebhookProcessor {
 }
 
 // Process implements TranscriptProcessor. It sends the transcript to the
-// webhook, sets the response text from the reply, and stops the chain.
-func (w *WebhookProcessor) Process(req *TranscriptRequest, resp *TranscriptResponse) error {
+// webhook, returns the response text from the reply, and stops the chain.
+func (w *WebhookProcessor) Process(req *TranscriptRequest) (*TranscriptResponse, error) {
 	escapedBytes, err := json.Marshal(req.Transcript)
 	if err != nil {
-		return fmt.Errorf("JSON-escape transcript: %w", err)
+		return nil, fmt.Errorf("JSON-escape transcript: %w", err)
 	}
 	escaped := string(escapedBytes[1 : len(escapedBytes)-1])
 	payloadBody := strings.Replace(w.Payload, "$transcript", escaped, 1)
 
 	response, err := http.Post(w.URL, "application/json", bytes.NewReader([]byte(payloadBody)))
 	if err != nil {
-		return fmt.Errorf("webhook POST: %w", err)
+		return nil, fmt.Errorf("webhook POST: %w", err)
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		body, _ := io.ReadAll(response.Body)
-		return fmt.Errorf("webhook returned status %d: %s", response.StatusCode, body)
+		return nil, fmt.Errorf("webhook returned status %d: %s", response.StatusCode, body)
 	}
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		return fmt.Errorf("read webhook response body: %w", err)
+		return nil, fmt.Errorf("read webhook response body: %w", err)
 	}
 	log.Printf("webhook response: %s", body)
 
+	resp := &TranscriptResponse{StopProcessing: true}
 	var result struct {
 		Response string `json:"response"`
 	}
@@ -58,6 +59,5 @@ func (w *WebhookProcessor) Process(req *TranscriptRequest, resp *TranscriptRespo
 	} else {
 		resp.ResponseText = result.Response
 	}
-	resp.StopProcessing = true
-	return nil
+	return resp, nil
 }

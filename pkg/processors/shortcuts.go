@@ -56,8 +56,8 @@ func NewShortcutsProcessor(path, apiPassword string) (*ShortcutsProcessor, error
 
 // Process implements TranscriptProcessor. The first matching shortcut wins:
 // it POSTs to the shortcut URL and stops the chain (no TTS response text).
-// When no shortcut matches the request passes through unchanged.
-func (p *ShortcutsProcessor) Process(req *TranscriptRequest, resp *TranscriptResponse) error {
+// Returns (nil, nil) when no shortcut matches.
+func (p *ShortcutsProcessor) Process(req *TranscriptRequest) (*TranscriptResponse, error) {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
@@ -68,17 +68,16 @@ func (p *ShortcutsProcessor) Process(req *TranscriptRequest, resp *TranscriptRes
 		log.Printf("shortcut matched %q -> %s", sc.Pattern, sc.URL)
 		response, err := http.Post(sc.URL, "", nil)
 		if err != nil {
-			return fmt.Errorf("shortcut POST to %s: %w", sc.URL, err)
+			return nil, fmt.Errorf("shortcut POST to %s: %w", sc.URL, err)
 		}
 		_, _ = io.Copy(io.Discard, response.Body)
 		response.Body.Close()
 		if response.StatusCode != http.StatusOK {
-			return fmt.Errorf("shortcut POST to %s returned status %d", sc.URL, response.StatusCode)
+			return nil, fmt.Errorf("shortcut POST to %s returned status %d", sc.URL, response.StatusCode)
 		}
-		resp.StopProcessing = true
-		return nil
+		return &TranscriptResponse{StopProcessing: true}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // RegisterRoutes registers the shortcuts CRUD HTTP handlers on the given mux.
