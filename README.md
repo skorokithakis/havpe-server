@@ -44,7 +44,9 @@ lines. Then re-flash the firmware to the device.
 | `WEBHOOK_URL`        | Yes      | URL to POST transcripts to (receives JSON, returns JSON)                                       |
 | `WEBHOOK_PAYLOAD`    | Yes      | JSON template for the POST body; `$transcript` is replaced with the JSON-escaped transcript    |
 | `DEVICE_HOST`        | No       | Hostname or IP of the Voice PE device. If not set, the server discovers it via mDNS by looking for ESPHome devices named `home-assistant-voice-*`. |
-| `API_PASSWORD`       | No*      | Password for the shortcuts CRUD API (HTTP Basic Auth). Required when `-shortcuts` is set.      |
+| `API_PASSWORD`       | Yes      | Password for the shortcuts and settings CRUD APIs (HTTP Basic Auth).                           |
+| `STT_LANGUAGE`       | No       | ElevenLabs STT language code. Defaults to `en`.                                                |
+| `TTS_SPEED`          | No       | ElevenLabs TTS playback speed. Defaults to `1.0`.                                              |
 
 You can use a `.envrc` file with [direnv](https://direnv.net/) to set these
 automatically.
@@ -84,6 +86,48 @@ with any username and `API_PASSWORD` as the password.
 | `DELETE` | `/shortcuts/{index}`  | Remove the shortcut at the given index           |
 
 Changes are persisted to the shortcuts file immediately after each write.
+
+
+## Settings
+
+Runtime settings (currently `stt_language` and `tts_speed`) can be adjusted
+without restarting the server. They are stored in a JSON file specified by the
+`-settings` flag (default: `settings.json`).
+
+Precedence: settings file > environment variables > built-in defaults.
+
+The server exposes a REST API on port 8085 for reading and updating settings at
+runtime. All endpoints require HTTP Basic Auth with any username and
+`API_PASSWORD` as the password.
+
+| Method | Path        | Description                                      |
+|--------|-------------|--------------------------------------------------|
+| `GET`  | `/settings` | Return current settings as a JSON object         |
+| `PUT`  | `/settings` | Update settings; accepts a partial JSON object   |
+
+```bash
+# Read current settings
+curl -u :yourpassword http://localhost:8085/settings
+
+# Update TTS speed
+curl -u :yourpassword -X PUT -H 'Content-Type: application/json' \
+  -d '{"tts_speed": 1.25}' http://localhost:8085/settings
+```
+
+Changes are persisted to the settings file immediately after each write.
+
+For Docker, mount the settings file for persistence:
+
+```bash
+docker run --network host \
+  -e ELEVENLABS_API_KEY \
+  -e WEBHOOK_URL \
+  -e WEBHOOK_PAYLOAD \
+  -e API_PASSWORD \
+  -v ./settings.json:/app/settings.json \
+  ghcr.io/skorokithakis/havpe-server \
+  -settings /app/settings.json
+```
 
 
 ## Recording mode
@@ -134,10 +178,11 @@ docker run --network host \
   -e ELEVENLABS_API_KEY \
   -e WEBHOOK_URL \
   -e WEBHOOK_PAYLOAD \
+  -e API_PASSWORD \
   ghcr.io/skorokithakis/havpe-server
 ```
 
-To use shortcuts, add `API_PASSWORD` and mount a file for persistence:
+To use shortcuts, mount a file for persistence:
 
 ```bash
 docker run --network host \

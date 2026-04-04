@@ -97,10 +97,45 @@ const silenceFramesRequired = 40
 // message from the ElevenLabs WebSocket before giving up and treating it as an error.
 const sttTranscriptTimeout = 10 * time.Second
 
-// elevenLabsSTTWebSocketURL is the ElevenLabs realtime speech-to-text WebSocket endpoint.
-// Query params select the model, language, audio format, and commit strategy. commit_strategy=manual
-// means we control when transcription is finalized by sending a chunk with commit=true.
-const elevenLabsSTTWebSocketURL = "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&language_code=en&audio_format=pcm_16000&commit_strategy=manual"
+// settings holds runtime-configurable values that can be loaded from a JSON file and
+// overridden by environment variables. The zero value is not valid; use the defaults
+// defined in main().
+type settings struct {
+	SttLanguage string  `json:"stt_language"`
+	TtsSpeed    float64 `json:"tts_speed"`
+}
+
+// currentSettings is the active settings, protected by settingsMutex.
+var currentSettings settings
+var settingsMutex sync.RWMutex
+
+// settingsFilePath is the path to the settings JSON file, set from the -settings flag.
+var settingsFilePath string
+
+// buildSTTWebSocketURL constructs the ElevenLabs realtime STT WebSocket URL using the
+// current SttLanguage setting. Query params select the model, language, audio format,
+// and commit strategy. commit_strategy=manual means we control when transcription is
+// finalized by sending a chunk with commit=true.
+func buildSTTWebSocketURL() string {
+	settingsMutex.RLock()
+	language := currentSettings.SttLanguage
+	settingsMutex.RUnlock()
+	return "wss://api.elevenlabs.io/v1/speech-to-text/realtime?model_id=scribe_v2_realtime&language_code=" + url.QueryEscape(language) + "&audio_format=pcm_16000&commit_strategy=manual"
+}
+
+// saveSettings writes the given settings to the file at path. The caller is responsible
+// for ensuring the settings value is consistent (e.g. by holding settingsMutex before
+// reading currentSettings and passing the copy here).
+func saveSettings(path string, s settings) error {
+	data, err := json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal settings: %w", err)
+	}
+	if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+		return fmt.Errorf("write settings file: %w", err)
+	}
+	return nil
+}
 
 // readDeadline is the duration after which a read on the TCP connection times out.
 // Refreshed after every successful ReadFrame call. When the device silently disappears
@@ -236,7 +271,7 @@ func saveShortcuts(path string, list []shortcut) error {
 func requireAuth(w http.ResponseWriter, r *http.Request) bool {
 	_, password, ok := r.BasicAuth()
 	if !ok || password != apiPassword {
-		w.Header().Set("WWW-Authenticate", `Basic realm="shortcuts"`)
+		w.Header().Set("WWW-Authenticate", `Basic realm="havpe"`)
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return false
 	}
@@ -468,6 +503,87 @@ func handleShortcuts(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// settingsUpdate is used to decode a PUT /settings request body. Pointer fields allow
+// partial updates: a nil pointer means the field was omitted from the request and the
+// current value should be kept unchanged.
+type settingsUpdate struct {
+	SttLanguage *string  `json:"stt_language"`
+	TtsSpeed    *float64 `json:"tts_speed"`
+}
+
+// handleSettings handles GET and PUT requests for /settings. GET returns the current
+// settings as JSON. PUT accepts a partial JSON body and updates only the fields that
+// are present, then persists to disk.
+func handleSettings(w http.ResponseWriter, r *http.Request) {
+	if !requireAuth(w, r) {
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		settingsMutex.RLock()
+		data, err := json.Marshal(currentSettings)
+		settingsMutex.RUnlock()
+		if err != nil {
+			http.Error(w, "marshal settings: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+
+	case http.MethodPut:
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read request body: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		var update settingsUpdate
+		if err := json.Unmarshal(body, &update); err != nil {
+			http.Error(w, "invalid JSON: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		settingsMutex.Lock()
+		candidate := currentSettings
+		if update.SttLanguage != nil {
+			candidate.SttLanguage = *update.SttLanguage
+		}
+		if update.TtsSpeed != nil {
+			candidate.TtsSpeed = *update.TtsSpeed
+		}
+		if candidate.SttLanguage == "" {
+			settingsMutex.Unlock()
+			http.Error(w, "stt_language must not be empty", http.StatusBadRequest)
+			return
+		}
+		if candidate.TtsSpeed <= 0 {
+			settingsMutex.Unlock()
+			http.Error(w, "tts_speed must be positive", http.StatusBadRequest)
+			return
+		}
+		currentSettings = candidate
+		snapshot := currentSettings
+		settingsMutex.Unlock()
+
+		if err := saveSettings(settingsFilePath, snapshot); err != nil {
+			http.Error(w, "save settings: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("settings updated: stt_language=%s tts_speed=%.2f", snapshot.SttLanguage, snapshot.TtsSpeed)
+
+		data, err := json.Marshal(snapshot)
+		if err != nil {
+			http.Error(w, "marshal settings: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(data)
+
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
 // tryShortcut checks the transcript against the loaded shortcuts under a read lock.
 // The first matching shortcut wins: it POSTs an empty body to the shortcut's URL.
 // Returns (true, nil) on a 200 response, (true, err) on a non-200 or network error,
@@ -631,14 +747,65 @@ func discoverVoicePE() (string, error) {
 }
 
 func main() {
-	// Parse CLI flags before anything else so that -shortcuts and -record-dir are
-	// available during startup.
+	// Parse CLI flags before anything else so that -shortcuts, -record-dir, and
+	// -settings are available during startup.
 	flag.StringVar(&shortcutsFilePath, "shortcuts", "", "path to shortcuts JSON file ([regex, url] pairs)")
 	flag.StringVar(&recordDir, "record-dir", "", "path to directory for recording utterances as WAV files")
+	flag.StringVar(&settingsFilePath, "settings", "settings.json", "path to settings JSON file")
 	flag.Parse()
+
+	// Apply settings in precedence order: hardcoded defaults → env vars → settings file.
+	// If the settings file doesn't exist, create it with the current values so future
+	// runs can edit it directly.
+	currentSettings = settings{
+		SttLanguage: "en",
+		TtsSpeed:    1.0,
+	}
+
+	if language := os.Getenv("STT_LANGUAGE"); language != "" {
+		currentSettings.SttLanguage = language
+	}
+	if speedStr := os.Getenv("TTS_SPEED"); speedStr != "" {
+		speed, err := strconv.ParseFloat(speedStr, 64)
+		if err != nil {
+			log.Fatalf("parse TTS_SPEED=%q: %v", speedStr, err)
+		}
+		currentSettings.TtsSpeed = speed
+	}
+
+	if _, err := os.Stat(settingsFilePath); os.IsNotExist(err) {
+		if err := saveSettings(settingsFilePath, currentSettings); err != nil {
+			log.Fatalf("create settings file %s: %v", settingsFilePath, err)
+		}
+		log.Printf("created settings file: %s", settingsFilePath)
+	} else if err != nil {
+		log.Fatalf("stat settings file %s: %v", settingsFilePath, err)
+	} else {
+		data, err := os.ReadFile(settingsFilePath)
+		if err != nil {
+			log.Fatalf("read settings file %s: %v", settingsFilePath, err)
+		}
+		var fileSettings settings
+		if err := json.Unmarshal(data, &fileSettings); err != nil {
+			log.Fatalf("parse settings file %s: %v", settingsFilePath, err)
+		}
+		currentSettings = fileSettings
+		if currentSettings.SttLanguage == "" {
+			currentSettings.SttLanguage = "en"
+		}
+		if currentSettings.TtsSpeed == 0 {
+			currentSettings.TtsSpeed = 1.0
+		}
+		log.Printf("loaded settings from %s (stt_language=%s, tts_speed=%.2f)", settingsFilePath, currentSettings.SttLanguage, currentSettings.TtsSpeed)
+	}
 
 	// Validate required env vars before starting anything. These are permanent failures
 	// that cannot be recovered by retrying, so log.Fatalf is appropriate here.
+	apiPassword = os.Getenv("API_PASSWORD")
+	if apiPassword == "" {
+		log.Fatalf("API_PASSWORD environment variable is required")
+	}
+
 	// In recording mode the ElevenLabs and webhook vars are unused, so we skip them.
 	if recordDir == "" {
 		elevenLabsAPIKey = os.Getenv("ELEVENLABS_API_KEY")
@@ -663,11 +830,6 @@ func main() {
 	}
 
 	if shortcutsFilePath != "" {
-		apiPassword = os.Getenv("API_PASSWORD")
-		if apiPassword == "" {
-			log.Fatalf("API_PASSWORD environment variable is required when -shortcuts is set")
-		}
-
 		if _, err := os.Stat(shortcutsFilePath); os.IsNotExist(err) {
 			// Create an empty shortcuts file so the user has a valid starting point.
 			if err := os.WriteFile(shortcutsFilePath, []byte("[]\n"), 0o644); err != nil {
@@ -692,6 +854,11 @@ func main() {
 		http.HandleFunc("/shortcuts", handleShortcuts)
 		log.Printf("shortcuts CRUD API enabled at /shortcuts")
 	}
+
+	// Register the settings API unconditionally so it is always available regardless of
+	// whether shortcuts or recording mode are enabled.
+	http.HandleFunc("/settings", handleSettings)
+	log.Printf("settings API enabled at /settings")
 
 	defer func() {
 		if err := detector.Destroy(); err != nil {
@@ -1101,9 +1268,10 @@ func handleVoiceAssistantRequest(writer io.Writer, data []byte, pipeline *pipeli
 	// skip this when recordDir is set. We also skip when elevenLabsAPIKey is empty,
 	// which happens in tests where main() is never called.
 	if recordDir == "" && elevenLabsAPIKey != "" {
-		sttURL, err := url.Parse(elevenLabsSTTWebSocketURL)
+		sttURL, err := url.Parse(buildSTTWebSocketURL())
 		if err != nil {
-			// The URL is a compile-time constant, so a parse error is a programming mistake.
+			// A parse error here means the language setting produced an invalid URL, which
+			// should not happen since we use url.QueryEscape on the language value.
 			log.Fatalf("parse ElevenLabs STT WebSocket URL: %v", err)
 		}
 		dialer := websocket.Dialer{}
@@ -1727,14 +1895,22 @@ func runPipelineResponse(writer io.Writer, pipeline *pipelineState, ttsURL strin
 
 // synthesizeSpeech calls the ElevenLabs TTS API and returns the mp3 audio bytes.
 func synthesizeSpeech(text string) ([]byte, error) {
-	payload := map[string]string{
+	settingsMutex.RLock()
+	speed := currentSettings.TtsSpeed
+	settingsMutex.RUnlock()
+
+	payload := map[string]interface{}{
 		"text":     text,
 		"model_id": "eleven_v3",
+		"voice_settings": map[string]interface{}{
+			"speed": speed,
+		},
 	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal TTS payload: %w", err)
 	}
+	log.Printf("TTS request payload: %s", payloadBytes)
 
 	request, err := http.NewRequest("POST", "https://api.elevenlabs.io/v1/text-to-speech/bIHbv24MWmeRgasZH58o", bytes.NewReader(payloadBytes))
 	if err != nil {
