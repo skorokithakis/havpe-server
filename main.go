@@ -1795,6 +1795,30 @@ func runPipelineResponse(writer io.Writer, pipeline *pipelineState, ttsURL strin
 		return sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 	}
 
+	if strings.TrimSpace(transcript) == "" {
+		log.Printf("STT returned empty transcript, playing error sound")
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_END, []*api.VoiceAssistantEventData{
+			{Name: "text", Value: ""},
+		}); err != nil {
+			return err
+		}
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
+			{Name: "code", Value: "stt-no-text-recognized"},
+			{Name: "message", Value: "No text recognized"},
+		}); err != nil {
+			return err
+		}
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, nil); err != nil {
+			return err
+		}
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, []*api.VoiceAssistantEventData{
+			{Name: "url", Value: errorURL},
+		}); err != nil {
+			return err
+		}
+		return sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
+	}
+
 	log.Printf("transcript: %q", transcript)
 
 	if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_END, []*api.VoiceAssistantEventData{
