@@ -826,7 +826,23 @@ func main() {
 		if err := os.MkdirAll(recordDir, 0o755); err != nil {
 			log.Fatalf("create record directory %s: %v", recordDir, err)
 		}
-		log.Printf("recording mode active: utterances will be saved to %s", recordDir)
+		// Resume numbering from the highest existing <digits>.wav so we never
+		// overwrite recordings from a previous run. The glob approach only handles
+		// a fixed number of digits, so we use ReadDir and parse each stem instead.
+		entries, err := os.ReadDir(recordDir)
+		if err != nil {
+			log.Fatalf("read record directory %s: %v", recordDir, err)
+		}
+		for _, entry := range entries {
+			name := entry.Name()
+			if !strings.HasSuffix(name, ".wav") {
+				continue
+			}
+			if n, err := strconv.Atoi(strings.TrimSuffix(name, ".wav")); err == nil && n > recordingFileCounter {
+				recordingFileCounter = n
+			}
+		}
+		log.Printf("recording mode active: utterances will be saved to %s (starting at %03d.wav)", recordDir, recordingFileCounter+1)
 	}
 
 	if shortcutsFilePath != "" {
