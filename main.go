@@ -1641,6 +1641,15 @@ func handleRecordingAudio(writer io.Writer, data []byte, pipeline *pipelineState
 			}); err != nil {
 				return err
 			}
+			// The device's state machine expects the full pipeline event sequence
+			// (including TTS) before it returns to idle. Without these events it
+			// stays in the "processing" state (blinking white) indefinitely.
+			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, nil); err != nil {
+				return err
+			}
+			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, nil); err != nil {
+				return err
+			}
 			return sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 		}
 	}
