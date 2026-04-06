@@ -1498,14 +1498,6 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 		// readSTTMessages goroutine rather than leaving it running until the connection
 		// is eventually dropped by the server.
 		closeSTTConnection(pipeline)
-		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_VAD_END, nil); err != nil {
-			return err
-		}
-		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_END, []*api.VoiceAssistantEventData{
-			{Name: "text", Value: ""},
-		}); err != nil {
-			return err
-		}
 		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
 			{Name: "code", Value: "stt-no-text-recognized"},
 			{Name: "message", Value: "No speech detected"},
@@ -1633,23 +1625,11 @@ func handleRecordingAudio(writer io.Writer, data []byte, pipeline *pipelineState
 				}
 			}
 			pipeline.active = false
-			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_VAD_END, nil); err != nil {
-				return err
-			}
-			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_END, []*api.VoiceAssistantEventData{
-				{Name: "text", Value: ""},
-			}); err != nil {
-				return err
-			}
-			// The device's state machine expects the full pipeline event sequence
-			// (including TTS) before it returns to idle. Without these events it
-			// stays in the "processing" state (blinking white) indefinitely.
-			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_START, nil); err != nil {
-				return err
-			}
-			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_TTS_END, nil); err != nil {
-				return err
-			}
+			// The device needs a brief pause before RUN_END, otherwise it stays
+			// in the "processing" state (blinking white). Without this delay the
+			// event arrives before the device has finished processing the last
+			// audio frames internally.
+			time.Sleep(50 * time.Millisecond)
 			return sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 		}
 	}
