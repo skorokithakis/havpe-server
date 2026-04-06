@@ -1,6 +1,6 @@
 ---
 id: hs-nrcg
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-04-06T14:01:04Z

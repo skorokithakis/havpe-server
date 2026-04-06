@@ -1,6 +1,6 @@
 ---
 id: hs-xkzm
-status: open
+status: closed
 deps: []
 links: []
 created: 2026-04-06T13:59:55Z

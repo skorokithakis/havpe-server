@@ -32,3 +32,5 @@ havpe-server
 .envrc
 misc/coding-team
 ARCHITECTURE.md
+data/
+wakewords/
