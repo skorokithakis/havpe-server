@@ -1482,6 +1482,14 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 		// readSTTMessages goroutine rather than leaving it running until the connection
 		// is eventually dropped by the server.
 		closeSTTConnection(pipeline)
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_VAD_END, nil); err != nil {
+			return err
+		}
+		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_END, []*api.VoiceAssistantEventData{
+			{Name: "text", Value: ""},
+		}); err != nil {
+			return err
+		}
 		if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_ERROR, []*api.VoiceAssistantEventData{
 			{Name: "code", Value: "stt-no-text-recognized"},
 			{Name: "message", Value: "No speech detected"},
@@ -1609,6 +1617,14 @@ func handleRecordingAudio(writer io.Writer, data []byte, pipeline *pipelineState
 				}
 			}
 			pipeline.active = false
+			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_VAD_END, nil); err != nil {
+				return err
+			}
+			if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_STT_END, []*api.VoiceAssistantEventData{
+				{Name: "text", Value: ""},
+			}); err != nil {
+				return err
+			}
 			return sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 		}
 	}
