@@ -78,7 +78,7 @@ const vadSampleRate = 16000
 
 // speechStartThreshold is the minimum Infer() probability required to begin speech.
 // With the correct Silero v5 model, speech probabilities are 0.7-0.99 during speech.
-const speechStartThreshold = 0.5
+const speechStartThreshold = 0.35
 
 // speechContinueThreshold is the minimum Infer() probability to keep speech active once
 // speech has started. Lower than start threshold to avoid mid-sentence cutoffs on brief
