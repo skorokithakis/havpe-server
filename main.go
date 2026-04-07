@@ -84,7 +84,7 @@ const speechStartThreshold = 0.5
 // speech has started. Lower than start threshold to avoid mid-sentence cutoffs on brief
 // pauses where probability dips. Must be high enough to not trigger on background noise
 // (e.g. TV), which typically produces probabilities in the 0.15-0.3 range.
-const speechContinueThreshold = 0.4
+const speechContinueThreshold = 0.5
 
 // speechStartFramesRequired is the number of consecutive speech frames required before
 // speech is considered started. This avoids starting on a single transient spike.
