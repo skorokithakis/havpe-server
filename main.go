@@ -82,8 +82,9 @@ const speechStartThreshold = 0.5
 
 // speechContinueThreshold is the minimum Infer() probability to keep speech active once
 // speech has started. Lower than start threshold to avoid mid-sentence cutoffs on brief
-// pauses where probability dips.
-const speechContinueThreshold = 0.15
+// pauses where probability dips. Must be high enough to not trigger on background noise
+// (e.g. TV), which typically produces probabilities in the 0.15-0.3 range.
+const speechContinueThreshold = 0.3
 
 // speechStartFramesRequired is the number of consecutive speech frames required before
 // speech is considered started. This avoids starting on a single transient spike.
@@ -1394,7 +1395,7 @@ func readSTTMessages(conn *websocket.Conn, transcriptChannel chan string) {
 // handleVoiceAssistantAudio handles message type 106. It accumulates PCM chunks into
 // pipeline.audioBuffer while the pipeline is active. Each incoming chunk is fed through
 // the Silero VAD in 1024-byte (32ms, 512-sample) windows to detect end-of-speech. The
-// pipeline is finalized when 800ms of consecutive silence follows detected speech, or
+// pipeline is finalized when 1280ms of consecutive silence follows detected speech, or
 // when the hard audioCaptureWindow maximum is reached. Audio frames arriving when the
 // pipeline is inactive are silently ignored.
 func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipelineState, ttsURL string, errorURL string, ttsResponseURL string) error {
