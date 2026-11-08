@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -139,7 +140,7 @@ func saveSettings(path string, s settings) error {
 }
 
 // readDeadline is the duration after which a read on the TCP connection times out.
-// Refreshed after every successful ReadFrame call. When the device silently disappears
+// Set before every ReadFrame call. When the device silently disappears
 // (power loss, no TCP RST), this prevents the server from blocking indefinitely until
 // OS-level TCP keepalive fires (~2 hours on Linux).
 const readDeadline = 60 * time.Second
@@ -164,10 +165,71 @@ var webhookURL string
 // The literal string $transcript is replaced at call time with the JSON-escaped transcript.
 var webhookPayload string
 
-// ttsAudioBuffer holds the most recently synthesized TTS mp3 audio, protected by
-// ttsAudioMutex so that concurrent HTTP requests and pipeline writes don't race.
-var ttsAudioBuffer []byte
-var ttsAudioMutex sync.Mutex
+// ttsStream holds the response body of the most recently started TTS request, waiting
+// for the device to fetch it from /tts.mp3. It is protected by ttsStreamMutex.
+var ttsStream io.ReadCloser
+var ttsStreamMutex sync.Mutex
+
+// setPendingTTSStream makes stream the one TTS stream the device may fetch. A stream
+// that was never fetched is closed here because the device plays every reply through a
+// single URL, so an unread body would otherwise leak its connection until it timed out.
+func setPendingTTSStream(stream io.ReadCloser) {
+	ttsStreamMutex.Lock()
+	previous := ttsStream
+	ttsStream = stream
+	ttsStreamMutex.Unlock()
+	if previous != nil {
+		previous.Close()
+	}
+}
+
+// takePendingTTSStream returns the pending TTS stream and clears it, so a second fetch
+// of /tts.mp3 cannot replay audio the device already started playing.
+func takePendingTTSStream() io.ReadCloser {
+	ttsStreamMutex.Lock()
+	defer ttsStreamMutex.Unlock()
+	stream := ttsStream
+	ttsStream = nil
+	return stream
+}
+
+// discardPendingTTSStream closes stream unless the /tts.mp3 handler has already taken
+// it. The handler takes the stream before reading it, so an owned stream must not be
+// closed here while it is being relayed to the device.
+func discardPendingTTSStream(stream io.ReadCloser) {
+	if stream == nil {
+		return
+	}
+	ttsStreamMutex.Lock()
+	if ttsStream != stream {
+		ttsStreamMutex.Unlock()
+		return
+	}
+	ttsStream = nil
+	ttsStreamMutex.Unlock()
+	stream.Close()
+}
+
+// webhookClient is used for the main webhook. The amoledesp32 client cancels a run when
+// no pipeline event arrives for 60 seconds, and that timer restarts at STT_END, which is
+// sent just before the webhook call. 45 seconds for the webhook plus up to 10 seconds
+// for the TTS response headers keeps the whole step under that limit, so the device
+// hears error.wav instead of giving up on its own.
+var webhookClient = &http.Client{Timeout: 45 * time.Second}
+
+// shortcutClient is used for shortcut webhooks. Shortcuts hit local services that answer
+// quickly, so 10 seconds only catches a service that is down or hung.
+var shortcutClient = &http.Client{Timeout: 10 * time.Second}
+
+// ttsClient limits only the wait for the TTS response headers. A total timeout
+// (http.Client.Timeout) would also cover reading the body, which would cut off long
+// replies once the audio is streamed to the device. The default transport is cloned so
+// that its dial and TLS handshake timeouts still apply.
+var ttsClient = func() *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 10 * time.Second
+	return &http.Client{Transport: transport}
+}()
 
 // shortcut pairs a compiled regular expression with the URL to POST to when the
 // expression matches a transcript. rawPattern holds the original pattern string
@@ -598,7 +660,7 @@ func tryShortcut(transcript string) (bool, error) {
 			continue
 		}
 		log.Printf("shortcut matched %q -> %s", shortcut.Pattern, shortcut.URL)
-		response, err := http.Post(shortcut.URL, "", nil)
+		response, err := shortcutClient.Post(shortcut.URL, "", nil)
 		if err != nil {
 			return true, fmt.Errorf("shortcut POST to %s: %w", shortcut.URL, err)
 		}
@@ -894,17 +956,13 @@ func main() {
 		w.Header().Set("Content-Type", "audio/wav")
 		http.ServeFile(w, r, "error.wav")
 	})
-	// /tts.mp3 serves the most recently synthesized TTS audio. The buffer is written
-	// before the device is told to fetch this URL, so a race between write and read
-	// is not possible in normal operation; the mutex guards against any edge cases.
-	http.HandleFunc("/tts.mp3", func(w http.ResponseWriter, r *http.Request) {
-		ttsAudioMutex.Lock()
-		audio := make([]byte, len(ttsAudioBuffer))
-		copy(audio, ttsAudioBuffer)
-		ttsAudioMutex.Unlock()
-		w.Header().Set("Content-Type", "audio/mpeg")
-		w.Write(audio)
-	})
+	// /tts.mp3 streams the pending TTS audio for the most recent reply. The stream is
+	// opened before the device is told to fetch this URL, so a race between write and
+	// read is not possible in normal operation; the mutex guards against any edge cases.
+	//
+	// Caveat: the Home Assistant Voice PE (ESPHome media player) has not been tested
+	// with a chunked /tts.mp3 response. If HAVPE playback breaks, look here first.
+	http.HandleFunc("/tts.mp3", handleTTSAudio)
 	go func() {
 		listenAddress := fmt.Sprintf("0.0.0.0:%d", httpPort)
 		log.Printf("starting HTTP server on %s", listenAddress)
@@ -995,12 +1053,6 @@ func handleConnection(conn net.Conn, ttsURL string, errorURL string, ttsResponse
 	// lw serialises all writes to conn. The read loop and the ping goroutine both write
 	// to the same TCP connection, so without this mutex their frame bytes would interleave.
 	lw := &lockedWriter{conn: conn}
-
-	// Set the initial read deadline before the handshake. It is refreshed after every
-	// successful ReadFrame call so that a healthy but slow device does not time out.
-	if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
-		return fmt.Errorf("set initial read deadline: %w", err)
-	}
 
 	// bufio.Reader is required so that ReadFrame can use it as an io.ByteReader
 	// for varint decoding without wrapping it again internally.
@@ -1142,18 +1194,16 @@ func handleConnection(conn net.Conn, ttsURL string, errorURL string, ttsResponse
 	}
 }
 
-// readFrameWithDeadline reads one frame and refreshes the read deadline on success.
-// Keeping the deadline refresh next to the ReadFrame call makes it obvious that every
-// successful read extends the window, and that a silent device will eventually time out.
+// readFrameWithDeadline sets the read deadline and then reads one frame. The deadline
+// must be set right before the read, not after the previous one: the read loop blocks
+// inside runPipelineResponse while the webhook and TTS run, and a deadline set after
+// the previous read would expire during a long run, so the next read would fail at once
+// and drop a healthy connection.
 func readFrameWithDeadline(conn net.Conn, reader *bufio.Reader) (uint32, []byte, error) {
-	messageType, data, err := ReadFrame(reader)
-	if err != nil {
-		return 0, nil, err
-	}
 	if err := conn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
-		return 0, nil, fmt.Errorf("refresh read deadline: %w", err)
+		return 0, nil, fmt.Errorf("set read deadline: %w", err)
 	}
-	return messageType, data, nil
+	return ReadFrame(reader)
 }
 
 // readHandshakeResponse reads frames from reader until a frame with the expected message
@@ -1755,7 +1805,7 @@ func postWebhook(transcript string) (string, error) {
 	escaped := string(escapedBytes[1 : len(escapedBytes)-1])
 	payloadBody := strings.Replace(webhookPayload, "$transcript", escaped, 1)
 
-	response, err := http.Post(webhookURL, "application/json", bytes.NewReader([]byte(payloadBody)))
+	response, err := webhookClient.Post(webhookURL, "application/json", bytes.NewReader([]byte(payloadBody)))
 	if err != nil {
 		return "", fmt.Errorf("webhook POST: %w", err)
 	}
@@ -1786,7 +1836,7 @@ func postWebhook(transcript string) (string, error) {
 
 // runPipelineResponse waits for the committed transcript from the ElevenLabs realtime STT
 // WebSocket, posts it to the webhook, and sends the remaining pipeline events to the device.
-// When the webhook returns a non-empty response text, it is synthesized to speech and the
+// When the webhook returns a non-empty response text, it opens the TTS audio stream and the
 // device plays ttsResponseURL; otherwise the device plays ttsURL (tone.wav). On any failure
 // it plays errorURL with a VOICE_ASSISTANT_ERROR event. On the first write error, it stops
 // sending further events and returns immediately.
@@ -1908,17 +1958,23 @@ func runPipelineResponse(writer io.Writer, pipeline *pipelineState, ttsURL strin
 	}
 
 	playbackURL := ttsURL
+	var pendingStream io.ReadCloser
 	if responseText != "" {
-		audio, err := synthesizeSpeech(responseText)
+		stream, err := openTTSSpeechStream(responseText)
 		if err != nil {
-			log.Printf("synthesizeSpeech error, falling back to tone.wav: %v", err)
+			log.Printf("openTTSSpeechStream error, falling back to tone.wav: %v", err)
 		} else {
-			ttsAudioMutex.Lock()
-			ttsAudioBuffer = audio
-			ttsAudioMutex.Unlock()
+			setPendingTTSStream(stream)
+			pendingStream = stream
 			playbackURL = ttsResponseURL
 		}
 	}
+
+	// A write failure before TTS_END means the device never learns to fetch the audio,
+	// so the stream would sit unread until the next reply replaces it. Clearing
+	// pendingStream after a successful TTS_END hands ownership to the device and keeps
+	// this cleanup from closing the stream the handler is relaying.
+	defer func() { discardPendingTTSStream(pendingStream) }()
 
 	if err := sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_INTENT_START, nil); err != nil {
 		return err
@@ -1936,18 +1992,63 @@ func runPipelineResponse(writer io.Writer, pipeline *pipelineState, ttsURL strin
 	}); err != nil {
 		return err
 	}
+	pendingStream = nil
 	return sendEvent(writer, api.VoiceAssistantEvent_VOICE_ASSISTANT_RUN_END, nil)
 }
 
-// synthesizeSpeech calls the ElevenLabs TTS API and returns the mp3 audio bytes.
-func synthesizeSpeech(text string) ([]byte, error) {
+// handleTTSAudio streams the pending TTS audio to the device. The stream is copied in
+// chunks with a flush after each one so playback starts before ElevenLabs finishes
+// generating the reply, and it is closed when the transfer ends or the device
+// disconnects. A missing stream means no reply is waiting, so the request is a 404.
+func handleTTSAudio(w http.ResponseWriter, r *http.Request) {
+	stream := takePendingTTSStream()
+	if stream == nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer stream.Close()
+
+	// The handler can block in Read until ElevenLabs produces more audio, so closing the
+	// upstream stream when the device goes away is the only way to stop the transfer
+	// promptly; writes alone only fail once there is something to write.
+	stopClose := context.AfterFunc(r.Context(), func() { stream.Close() })
+	defer stopClose()
+
+	w.Header().Set("Content-Type", "audio/mpeg")
+	flusher, _ := w.(http.Flusher)
+
+	buffer := make([]byte, 32*1024)
+	for {
+		read, err := stream.Read(buffer)
+		if read > 0 {
+			if _, writeErr := w.Write(buffer[:read]); writeErr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				log.Printf("stream TTS audio: %v", err)
+			}
+			return
+		}
+	}
+}
+
+// openTTSSpeechStream starts an ElevenLabs streaming TTS request and returns the
+// response body once the headers arrive. The caller owns the returned stream and must
+// close it. Using the streaming endpoint lets the device start playing while the rest
+// of the reply is still being generated.
+func openTTSSpeechStream(text string) (io.ReadCloser, error) {
 	settingsMutex.RLock()
 	speed := currentSettings.TtsSpeed
 	settingsMutex.RUnlock()
 
 	payload := map[string]interface{}{
 		"text":     text,
-		"model_id": "eleven_v3",
+		"model_id": "eleven_flash_v2_5",
 		"voice_settings": map[string]interface{}{
 			"speed": speed,
 		},
@@ -1958,7 +2059,7 @@ func synthesizeSpeech(text string) ([]byte, error) {
 	}
 	log.Printf("TTS request payload: %s", payloadBytes)
 
-	request, err := http.NewRequest("POST", "https://api.elevenlabs.io/v1/text-to-speech/bIHbv24MWmeRgasZH58o", bytes.NewReader(payloadBytes))
+	request, err := http.NewRequest("POST", "https://api.elevenlabs.io/v1/text-to-speech/bIHbv24MWmeRgasZH58o/stream", bytes.NewReader(payloadBytes))
 	if err != nil {
 		return nil, fmt.Errorf("create TTS request: %w", err)
 	}
@@ -1966,22 +2067,27 @@ func synthesizeSpeech(text string) ([]byte, error) {
 	request.Header.Set("xi-api-key", elevenLabsAPIKey)
 	request.Header.Set("Accept", "audio/mpeg")
 
-	response, err := http.DefaultClient.Do(request)
+	response, err := ttsClient.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("TTS request: %w", err)
 	}
-	defer response.Body.Close()
-
-	responseBody, err := io.ReadAll(response.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read TTS response body: %w", err)
-	}
 
 	if response.StatusCode != http.StatusOK {
+		// ResponseHeaderTimeout only covers the headers, so a stalled error body would
+		// block the pipeline indefinitely. Keep the diagnostic body, but bound both its
+		// size and the time spent reading it; the status code alone is enough to know
+		// the reply falls back to the tone.
+		stopClose := time.AfterFunc(2*time.Second, func() { response.Body.Close() })
+		responseBody, err := io.ReadAll(io.LimitReader(response.Body, 4*1024))
+		stopClose.Stop()
+		response.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("TTS API returned status %d: read error body: %w", response.StatusCode, err)
+		}
 		return nil, fmt.Errorf("TTS API returned status %d: %s", response.StatusCode, responseBody)
 	}
 
-	return responseBody, nil
+	return response.Body, nil
 }
 
 // sendEvent sends a VoiceAssistantEventResponse with the given event type and optional data.
