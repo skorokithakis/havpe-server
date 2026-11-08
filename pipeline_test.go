@@ -71,6 +71,30 @@ func TestHandleVoiceAssistantAudio_accumulatesWithinWindow(t *testing.T) {
 	}
 }
 
+// TestHandleVoiceAssistantAudio_lateFirstChunkKeepsPreSpeechWindowActive verifies that
+// preSpeechTimeout is measured from the first audio chunk rather than from the start
+// request. A device that plays a wake chime before streaming must not lose that time
+// from the window in which the user is expected to start speaking.
+func TestHandleVoiceAssistantAudio_lateFirstChunkKeepsPreSpeechWindowActive(t *testing.T) {
+	conn := &nullConn{}
+	pipeline := &pipelineState{
+		active: true,
+		// The start request arrived 4 seconds ago, longer than preSpeechTimeout, but the
+		// first audio chunk only arrives now.
+		startTime: time.Now().Add(-4 * time.Second),
+	}
+
+	// A partial frame avoids running the VAD, which is irrelevant to the timeout check.
+	handleVoiceAssistantAudio(conn, marshalAudioChunk(t, makeZeroFrame(500)), pipeline, "", "", "")
+
+	if !pipeline.active {
+		t.Error("pipeline should stay active: pre-speech timeout is measured from the first audio chunk")
+	}
+	if !pipeline.vadStartSent {
+		t.Error("vadStartSent should be true after the first chunk")
+	}
+}
+
 // TestHandleVoiceAssistantAudio_windowElapsedFinalises verifies that once
 // audioCaptureWindow has elapsed the pipeline is deactivated and the response is sent.
 // We back-date startTime so the window appears to have already elapsed.

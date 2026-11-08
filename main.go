@@ -710,6 +710,16 @@ type pipelineState struct {
 	// startTime is when the pipeline run began (i.e. when start=true was received).
 	// Audio collection stops once audioCaptureWindow has elapsed since startTime.
 	startTime time.Time
+	// firstAudioTime is when the first audio chunk of the run arrived. preSpeechTimeout
+	// is measured from here rather than from startTime because the device can play a
+	// wake chime before opening its microphone, which would otherwise eat into the
+	// window in which the user is expected to start speaking. Zero until the first
+	// chunk is seen.
+	firstAudioTime time.Time
+	// peakSpeechProbability is the highest Silero probability seen in this run. It is
+	// logged when the pre-speech timeout fires so the threshold can be tuned against
+	// real audio instead of guessing.
+	peakSpeechProbability float32
 	// audioBuffer accumulates PCM chunks from the device.
 	audioBuffer []byte
 	// vadStartSent tracks whether STT_VAD_START has been sent for this run,
@@ -1573,6 +1583,7 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 			return err
 		}
 		pipeline.vadStartSent = true
+		pipeline.firstAudioTime = time.Now()
 	}
 
 	chunkData := chunk.GetData()
@@ -1604,6 +1615,10 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 		if err != nil {
 			log.Printf("VAD infer error: %v", err)
 			continue
+		}
+
+		if probability > pipeline.peakSpeechProbability {
+			pipeline.peakSpeechProbability = probability
 		}
 
 		if !pipeline.speechDetected {
@@ -1640,8 +1655,11 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 
 	elapsed := time.Since(pipeline.startTime)
 
-	if !pipeline.speechDetected && elapsed >= preSpeechTimeout {
-		log.Printf("no speech detected after %v, aborting pipeline", preSpeechTimeout)
+	if !pipeline.speechDetected && time.Since(pipeline.firstAudioTime) >= preSpeechTimeout {
+		log.Printf("no speech detected in %v after first audio, aborting pipeline "+
+			"(peak probability %.3f, start threshold %.3f, request-to-first-audio delay %v)",
+			preSpeechTimeout, pipeline.peakSpeechProbability, speechStartThreshold,
+			pipeline.firstAudioTime.Sub(pipeline.startTime))
 		pipeline.active = false
 		// No transcript will ever arrive, so stop the worker now rather than leaving its
 		// socket and goroutines running until the device disconnects.
