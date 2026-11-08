@@ -84,8 +84,10 @@ const speechStartThreshold = 0.35
 // speechContinueThreshold is the minimum Infer() probability to keep speech active once
 // speech has started. Lower than start threshold to avoid mid-sentence cutoffs on brief
 // pauses where probability dips. Must be high enough to not trigger on background noise
-// (e.g. TV), which typically produces probabilities in the 0.15-0.3 range.
-const speechContinueThreshold = 0.5
+// (e.g. TV), which typically produces probabilities in the 0.15-0.3 range. It was 0.5,
+// above the start threshold, after the start threshold was lowered to 0.35; that made
+// soft speech count as silence and cut quieter devices off mid-sentence.
+const speechContinueThreshold = 0.3
 
 // speechStartFramesRequired is the number of consecutive speech frames required before
 // speech is considered started. This avoids starting on a single transient spike.
