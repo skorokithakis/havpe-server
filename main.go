@@ -77,6 +77,12 @@ const vadFrameSize = 1024
 // vadSampleRate is the audio sample rate expected by the VAD.
 const vadSampleRate = 16000
 
+// vadContextSampleCount is how many samples of the previous window Silero v5 requires in
+// front of the window it is scoring. The model input is therefore 576 samples at 16kHz
+// rather than the 512 samples of a bare window, and skipping the context makes speech
+// score low and unstable.
+const vadContextSampleCount = 64
+
 // speechStartThreshold is the minimum Infer() probability required to begin speech.
 // With the correct Silero v5 model, speech probabilities are 0.7-0.99 during speech.
 const speechStartThreshold = 0.35
@@ -84,7 +90,9 @@ const speechStartThreshold = 0.35
 // speechContinueThreshold is the minimum Infer() probability to keep speech active once
 // speech has started. Lower than start threshold to avoid mid-sentence cutoffs on brief
 // pauses where probability dips. Must be high enough to not trigger on background noise
-// (e.g. TV), which typically produces probabilities in the 0.15-0.3 range. It was 0.5,
+// (e.g. TV), which typically produces probabilities in the 0.15-0.3 range; that range was
+// measured while Infer() was being called without the 64 samples of context Silero v5
+// expects, so it is not a measurement of noise under the current model input. It was 0.5,
 // above the start threshold, after the start threshold was lowered to 0.35; that made
 // soft speech count as silence and cut quieter devices off mid-sentence.
 const speechContinueThreshold = 0.3
@@ -722,6 +730,11 @@ type pipelineState struct {
 	// logged when the pre-speech timeout fires so the threshold can be tuned against
 	// real audio instead of guessing.
 	peakSpeechProbability float32
+	// peakSilenceRunProbability is the highest Silero probability seen since the current
+	// silence run began, i.e. across the frames counted by consecutiveSilenceFrames. It is
+	// logged at end-of-speech so a run that ended on near-threshold audio can be told
+	// apart from one that ended on pure silence.
+	peakSilenceRunProbability float32
 	// audioBuffer accumulates PCM chunks from the device.
 	audioBuffer []byte
 	// vadStartSent tracks whether STT_VAD_START has been sent for this run,
@@ -730,6 +743,10 @@ type pipelineState struct {
 	// vadFrameBuffer holds leftover bytes from the previous audio chunk that did not
 	// fill a complete 1024-byte VAD window. Carried forward until the next chunk arrives.
 	vadFrameBuffer []byte
+	// vadContext holds the last 64 samples of the previous VAD window, which Silero v5
+	// requires in front of the next window. The zero value gives the first window of a
+	// run a context of silence, which is what the reference Silero implementation does.
+	vadContext [vadContextSampleCount]float32
 	// speechDetected is true once the VAD has classified at least one frame as speech.
 	// End-of-speech is only declared after speech has been detected.
 	speechDetected bool
@@ -1557,6 +1574,30 @@ func readSTTMessages(conn *websocket.Conn, transcriptChannel chan string) {
 	}
 }
 
+// inferVADWithContext scores one 512-sample VAD window with the 64 samples of context
+// that Silero v5 expects in front of it, and stores the tail of that window as the
+// context for the next call.
+//
+// The library's Infer() prepends its own stored context only while currSample > 0, and
+// only Detect() advances currSample, so calling Infer() directly hands the model a bare
+// window. We build the context ourselves rather than call Detect() because Detect()
+// consumes a whole buffer and returns speech segments, while the pipeline needs one
+// probability per streamed window so it can apply its own start and continue thresholds
+// frame by frame. This relies on Infer() passing its argument to the model unchanged: if
+// a later library version prepends the context inside Infer(), the model would receive
+// 640 samples and these scores would mean nothing, so check that before any upgrade.
+func inferVADWithContext(pipeline *pipelineState, samples []float32) (float32, error) {
+	// The stored context has no spare capacity, so append copies into a fresh slice
+	// instead of writing samples into the context we are about to send.
+	modelInput := append(pipeline.vadContext[:], samples...)
+	probability, err := detector.Infer(modelInput)
+
+	// Advance the context even when inference fails, otherwise the next window would be
+	// scored against audio two windows old.
+	copy(pipeline.vadContext[:], samples[len(samples)-vadContextSampleCount:])
+	return probability, err
+}
+
 // handleVoiceAssistantAudio handles message type 106. It accumulates PCM chunks into
 // pipeline.audioBuffer while the pipeline is active. Each incoming chunk is fed through
 // the Silero VAD in 1024-byte (32ms, 512-sample) windows to detect end-of-speech. The
@@ -1599,8 +1640,8 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 
 	// Prepend any leftover bytes from the previous chunk, then process complete VAD windows.
 	// Each window is vadFrameSize bytes (512 samples at 16kHz, 16-bit LE = 32ms of audio).
-	// Infer() requires exactly 512 samples per call and maintains RNN state across calls,
-	// so we must feed it one fixed-size window at a time rather than variable-length buffers.
+	// The pipeline needs one probability per fixed-size window to apply its thresholds, so
+	// windows are fed to the detector one at a time rather than as one whole buffer.
 	pipeline.vadFrameBuffer = append(pipeline.vadFrameBuffer, chunkData...)
 	for len(pipeline.vadFrameBuffer) >= vadFrameSize {
 		frame := pipeline.vadFrameBuffer[:vadFrameSize]
@@ -1613,7 +1654,7 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 			samples[i] = float32(sample) / 32768.0
 		}
 
-		probability, err := detector.Infer(samples)
+		probability, err := inferVADWithContext(pipeline, samples)
 		if err != nil {
 			log.Printf("VAD infer error: %v", err)
 			continue
@@ -1629,6 +1670,7 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 				if pipeline.consecutiveSpeechFrames >= speechStartFramesRequired {
 					pipeline.speechDetected = true
 					pipeline.consecutiveSilenceFrames = 0
+					pipeline.peakSilenceRunProbability = 0
 					log.Printf("speech start detected after %d consecutive frames", pipeline.consecutiveSpeechFrames)
 				}
 			} else {
@@ -1639,11 +1681,17 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 
 		if probability >= speechContinueThreshold {
 			pipeline.consecutiveSilenceFrames = 0
+			pipeline.peakSilenceRunProbability = 0
 		} else {
 			pipeline.consecutiveSilenceFrames++
+			if probability > pipeline.peakSilenceRunProbability {
+				pipeline.peakSilenceRunProbability = probability
+			}
 			if pipeline.consecutiveSilenceFrames >= silenceFramesRequired {
-				log.Printf("VAD end-of-speech detected after %d silence frames, finalising pipeline",
-					pipeline.consecutiveSilenceFrames)
+				log.Printf("VAD end-of-speech detected after %d silence frames, finalising pipeline "+
+					"(peak speech probability %.3f, peak silence run probability %.3f)",
+					pipeline.consecutiveSilenceFrames, pipeline.peakSpeechProbability,
+					pipeline.peakSilenceRunProbability)
 				pipeline.active = false
 				// Commit the transcript: queue a commit after all audio queued so far so
 				// ElevenLabs finalizes transcription with the complete utterance.
@@ -1676,8 +1724,14 @@ func handleVoiceAssistantAudio(writer io.Writer, data []byte, pipeline *pipeline
 	}
 
 	if elapsed >= audioCaptureWindow {
-		// Hard safety cap: finalize even if VAD never triggered end-of-speech.
-		log.Printf("audio capture window elapsed, finalising pipeline")
+		// Hard safety cap: finalize even if VAD never triggered end-of-speech. The peak
+		// silence run probability is logged with the frame count because the peak means
+		// nothing when the count is zero: no silence run was in progress at the cap, either
+		// because the last frame scored as speech or because speech never started.
+		log.Printf("audio capture window elapsed, finalising pipeline "+
+			"(peak speech probability %.3f, peak silence run probability %.3f, silence frames %d)",
+			pipeline.peakSpeechProbability, pipeline.peakSilenceRunProbability,
+			pipeline.consecutiveSilenceFrames)
 		pipeline.active = false
 		// Commit the transcript even on the hard cap so ElevenLabs finalizes what it has.
 		if pipeline.sttWorker != nil {
@@ -1716,8 +1770,9 @@ func handleRecordingAudio(writer io.Writer, data []byte, pipeline *pipelineState
 
 	chunkData := chunk.GetData()
 	pipeline.audioBuffer = append(pipeline.audioBuffer, chunkData...)
-	// Same VAD frame processing as the normal pipeline: feed 1024-byte windows to the
-	// detector and track consecutive speech/silence frames.
+	// Same VAD frame processing as the normal pipeline: cut the audio into 1024-byte
+	// (512-sample) windows, score each one through inferVADWithContext, which adds the
+	// context the model needs, and track consecutive speech/silence frames.
 	pipeline.vadFrameBuffer = append(pipeline.vadFrameBuffer, chunkData...)
 	for len(pipeline.vadFrameBuffer) >= vadFrameSize {
 		frame := pipeline.vadFrameBuffer[:vadFrameSize]
@@ -1729,7 +1784,7 @@ func handleRecordingAudio(writer io.Writer, data []byte, pipeline *pipelineState
 			samples[i] = float32(sample) / 32768.0
 		}
 
-		probability, err := detector.Infer(samples)
+		probability, err := inferVADWithContext(pipeline, samples)
 		if err != nil {
 			log.Printf("VAD infer error: %v", err)
 			continue
